@@ -17,6 +17,43 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+def fp8_gemm(A, A_scale, B, B_scale, bias, out_dtype):
+    if A.numel() == 0:
+        # Deal with empty tensors (triggeted by empty MoE experts)
+        return torch.empty(size=(0, B.shape[0]),
+                           dtype=out_dtype,
+                           device=A.device)
+
+    native_fp8_support = (torch.cuda.is_available()
+                          and torch.cuda.get_device_capability() >= (8, 9))
+    if native_fp8_support:
+        need_reshape = A.dim() == 3
+        if need_reshape:
+            batch_size = A.shape[0]
+            A_input = A.reshape(-1, A.shape[-1])
+        else:
+            batch_size = None
+            A_input = A
+        output, _ = torch._scaled_mm(
+            A_input,
+            B,
+            out_dtype=out_dtype,
+            scale_a=A_scale,
+            scale_b=B_scale,
+            bias=bias,
+        )
+        if need_reshape:
+            output = output.reshape(batch_size, output.shape[0] // batch_size,
+                                    output.shape[1])
+    else:
+        output = torch.nn.functional.linear(
+            A.to(out_dtype) * A_scale,
+            B.t().to(out_dtype) * B_scale.to(out_dtype),
+            bias=bias,
+        )
+    return output
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -44,7 +81,7 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 89
+        return 70
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -244,12 +281,20 @@ class Fp8LinearMethod(LinearMethodBase):
         # torch._scaled_mm is more performant for matrices with
         # batch dimension > 16. Note that this could change
         # in the future.
-        output, _ = torch._scaled_mm(
-            qinput,
-            layer.weight,
+        # output, _ = torch._scaled_mm(
+        #     qinput,
+        #     layer.weight,
+        #     out_dtype=x.dtype,
+        #     scale_a=x_scale,
+        #     scale_b=layer.weight_scale,
+        #     bias=bias,
+        # )
+        output = fp8_gemm(
+            A=qinput,
+            B=layer.weight,
             out_dtype=x.dtype,
-            scale_a=x_scale,
-            scale_b=layer.weight_scale,
+            A_scale=x_scale,
+            B_scale=layer.weight_scale,
             bias=bias,
         )
 
