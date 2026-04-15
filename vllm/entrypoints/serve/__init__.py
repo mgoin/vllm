@@ -46,6 +46,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_cache_router(app)
 
+    from vllm.entrypoints.serve.scheduler.api_router import (
+        attach_router as attach_scheduler_router,
+    )
+
+    attach_scheduler_router(app)
+
     from vllm.entrypoints.serve.tokenize.api_router import (
         attach_router as attach_tokenize_router,
     )

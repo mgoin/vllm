@@ -141,6 +141,25 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def get_scheduler_config(self) -> dict[str, Any]:
+        """Return a snapshot of live-updatable scheduler config fields."""
+        ...
+
+    @abstractmethod
+    async def update_scheduler_config(
+        self, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Live-update a subset of scheduler config fields.
+
+        Only a whitelist of fields (e.g. ``max_num_batched_tokens``,
+        ``max_num_seqs``, ``long_prefill_token_threshold``,
+        ``enable_chunked_prefill``) can be updated at runtime. Validates
+        against ``max_model_len`` before applying and rolls back on
+        failure. Returns the full snapshot after the update.
+        """
+        ...
+
+    @abstractmethod
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

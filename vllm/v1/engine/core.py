@@ -598,6 +598,88 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
+    # Fields on SchedulerConfig that can be safely mutated at runtime.
+    # Other fields are either derived, consumed only at init, or would
+    # require rebuilding internal scheduler state (e.g. request queues).
+    _LIVE_UPDATABLE_SCHEDULER_FIELDS: tuple[str, ...] = (
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "max_num_seqs",
+        "long_prefill_token_threshold",
+        "enable_chunked_prefill",
+    )
+
+    def get_scheduler_config(self) -> dict[str, Any]:
+        """Return a snapshot of live-updatable scheduler config fields."""
+        sched_cfg = self.scheduler.scheduler_config
+        return {
+            field: getattr(sched_cfg, field)
+            for field in self._LIVE_UPDATABLE_SCHEDULER_FIELDS
+        }
+
+    def update_scheduler_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Live-update a subset of scheduler configuration fields.
+
+        Only fields listed in ``_LIVE_UPDATABLE_SCHEDULER_FIELDS`` can be
+        modified. Updates are validated against ``max_model_len`` before
+        being applied, and on failure the previous values are restored.
+
+        Returns the full snapshot of live-updatable fields after the update.
+        """
+        if not updates:
+            return self.get_scheduler_config()
+
+        sched_cfg = self.scheduler.scheduler_config
+        unknown = set(updates) - set(self._LIVE_UPDATABLE_SCHEDULER_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"Cannot live-update scheduler fields: {sorted(unknown)}. "
+                f"Allowed fields: {list(self._LIVE_UPDATABLE_SCHEDULER_FIELDS)}"
+            )
+
+        # Snapshot previous values so we can roll back on validation failure.
+        previous = {
+            field: getattr(sched_cfg, field)
+            for field in self._LIVE_UPDATABLE_SCHEDULER_FIELDS
+        }
+        previous_max_num_scheduled_tokens = self.scheduler.max_num_scheduled_tokens
+        previous_max_num_running_reqs = self.scheduler.max_num_running_reqs
+
+        try:
+            for field, value in updates.items():
+                setattr(sched_cfg, field, value)
+
+            # Re-validate invariants against max_model_len. This raises
+            # ValueError on invariant violations (e.g. max_num_batched_tokens
+            # < max_num_seqs).
+            sched_cfg.verify_max_model_len(
+                self.scheduler.vllm_config.model_config.max_model_len
+            )
+
+            # Refresh cached instance attributes on the scheduler that were
+            # populated from scheduler_config at __init__ time.
+            self.scheduler.max_num_scheduled_tokens = (
+                sched_cfg.max_num_scheduled_tokens
+                if sched_cfg.max_num_scheduled_tokens
+                else sched_cfg.max_num_batched_tokens
+            )
+            self.scheduler.max_num_running_reqs = sched_cfg.max_num_seqs
+        except Exception:
+            # Roll back scheduler_config and cached scheduler attrs.
+            for field, value in previous.items():
+                setattr(sched_cfg, field, value)
+            self.scheduler.max_num_scheduled_tokens = (
+                previous_max_num_scheduled_tokens
+            )
+            self.scheduler.max_num_running_reqs = previous_max_num_running_reqs
+            raise
+
+        logger.info(
+            "Live-updated scheduler config fields: %s",
+            {k: getattr(sched_cfg, k) for k in updates},
+        )
+        return self.get_scheduler_config()
+
     def _reset_caches(self, reset_running_requests=True) -> None:
         self.reset_prefix_cache(reset_running_requests=reset_running_requests)
         self.reset_mm_cache()

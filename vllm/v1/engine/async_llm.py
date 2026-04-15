@@ -902,6 +902,14 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def get_scheduler_config(self) -> dict[str, Any]:
+        return await self.engine_core.get_scheduler_config_async()
+
+    async def update_scheduler_config(
+        self, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.engine_core.update_scheduler_config_async(updates)
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.engine_core.sleep_async(level, mode)
 
