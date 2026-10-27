@@ -579,6 +579,7 @@ class AllGatherPublisher:
         impl = workspace.impl
         state = impl.state
         self.workspace = workspace
+        self.group = group
         self.impl = impl
         self.hidden = impl.hidden_size
         self.hidden_local = impl.hidden_local
@@ -601,6 +602,14 @@ class AllGatherPublisher:
 
     def precompile(self) -> None:
         self.gemm.precompile()
+
+    def reset(self) -> None:
+        """Drop an unconsumed publish and re-zero the workspace's stage state
+        (collective)."""
+        self._pending = None
+        self.impl.state.stage_state.zero_()
+        torch.accelerator.synchronize()
+        dist.barrier(group=self.group)
 
     def __call__(self, x: torch.Tensor, weight: torch.Tensor) -> Published:
         """Publish this rank's ``x @ weight.T`` column block."""

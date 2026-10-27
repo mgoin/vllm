@@ -41,6 +41,7 @@ from vllm.models.muse_spark.nvidia.ops.prepare_trtllm_nvfp4 import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from ...model import (
     MuseSpark1xColumnShardedStream,
@@ -242,10 +243,22 @@ EXPERTS_ROWS = range(2, 17)
 def routed_experts(moe: MuseSpark1xMoE) -> "MuseRoutedExperts | None":
     """The persistent routed experts of an NVFP4 MoE layer, which read the
     routing that the aux stream finished."""
+    from ...muse_moe_runner import MuseSparkModelOptNvFp4FusedMoE
     from ..experts.routed_experts import MuseRoutedExperts, build_routed_experts
 
     experts = build_routed_experts(moe.experts, ids_ready=True)
-    return experts if isinstance(experts, MuseRoutedExperts) else None
+    if isinstance(experts, MuseRoutedExperts):
+        return experts
+    # BF16 layers keep the stock experts; an NVFP4 layer without the prepared
+    # TRT-LLM kernel would silently run a mixed path (or assert in the runner).
+    if isinstance(
+        moe.experts.routed_experts.quant_method, MuseSparkModelOptNvFp4FusedMoE
+    ):
+        raise ValueError(
+            "decode_backend=latency_specialized needs the resolved FlashInfer "
+            f"TRT-LLM NVFP4 MoE backend for every NVFP4 layer: {experts}."
+        )
+    return None
 
 
 class LayerPlan(NamedTuple):
@@ -315,6 +328,11 @@ class SpecializedDecode:
                 raise ValueError(
                     "decode_backend=latency_specialized needs FlashInfer's "
                     "rmsnorm_sigmoid_gate for the attention output gate"
+                )
+            if attn.attn.backend != AttentionBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "decode_backend=latency_specialized needs the FLASHINFER "
+                    f"attention backend, not {attn.attn.backend.name}."
                 )
         rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -395,6 +413,21 @@ class SpecializedDecode:
                 tail_parity=parity,
             )
         return tail
+
+    def rearm(self) -> None:
+        """Re-arm the mailboxes and stage state after the memory-profiling
+        capture, which runs against a throwaway KV cache.
+
+        ``initialize_kv_cache`` calls this before the real capture, so the
+        executor starts from the state of a fresh one. The resets synchronize
+        the TP group, and ``initialize_kv_cache`` is collective over it.
+        """
+        self.boundaries.attention.reset()
+        for publisher in (self.boundaries.pooler, self.boundaries.unpooler):
+            if publisher is not None:
+                publisher.reset()
+        if self.tail is not None:
+            self.tail.reset()
 
     def plan(
         self,
