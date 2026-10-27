@@ -64,6 +64,38 @@ Bytes a step must stream, per rank and layer:
 The step is a pure weight-streaming problem at every batch size. Compute is
 never the limit: even at 128 rows each expert GEMM is M=4.
 
+## Executor kernel profile (8 rows and 128 rows, 8-layer truncated model, TP4, no EP)
+
+Per forward of 8 layers, rank 0 (`vllm bench forward --profile-dir`):
+
+| 8 rows, 1165 us total | us | calls | us/call |
+| --- | --- | --- | --- |
+| PublishingExpertsKernel (persistent NVFP4 experts) | 428 | 7 | 61 |
+| PublishingGemmKernel (o_proj / pooler / unpooler) | 238 | 22 | 10.8 |
+| L2Prefetch (side stream) | 173 | 23 | 7.5 |
+| lm_head GEMM | 145 | 1 | 145 |
+| AllReduceDualNorm (Lamport AR + dual norm) | 128 | 8 | 16.0 |
+| QkvKernel (fused qkv + qk-norm + rope + kv insert) | 122 | 8 | 15.2 |
+| RouterKernel (side stream) | 113 | 7 | 16.1 |
+| attention (trtllm-gen) | 103 | 8 | 12.8 |
+
+| 128 rows, 3783 us total | us | calls | us/call |
+| --- | --- | --- | --- |
+| expert gemm1+swiglu (stock TRT-LLM, gate is <=16 rows) | 1248 | 7 | 178 |
+| expert gemm2 (stock) | 626 | 7 | 89 |
+| lm_head GEMM | 598 | 1 | 598 |
+| PublishingGemmKernel | 300 | 22 | 13.7 |
+| o_proj (torch.mm, above the 64-row tactic) | 300 | 1 | 300 |
+| attention | 227 | 8 | 28.4 |
+| RouterKernel | 203 | 7 | 29.0 |
+| QkvKernel | 202 | 8 | 25.3 |
+| AllGatherDualNorm | 111 | 8 | 13.8 |
+
+Read: at 8 rows the dense projections run at 0.8-1.5 TB/s (10.8 us for 8.4 MB in the o_proj publish, 15 us
+for 19 MB of qkv), the Lamport all-reduce + dual norm costs 16 us, and the L2 prefetch kernels burn 25 us/layer
+of SM time on a side stream. At 128 rows the executor's own kernels are fine, the MoE is still stock
+(the <=16-row gate), and the `PublishingGemmKernel` at 13.7 us for 60.9 MB/layer is ~4.5 TB/s.
+
 ## Critique
 
 1. **No roofline accounting.** The handoff reports ms but not achieved GB/s, so
