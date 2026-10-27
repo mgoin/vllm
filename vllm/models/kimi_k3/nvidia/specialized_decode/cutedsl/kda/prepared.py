@@ -10,7 +10,13 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, layout, stream, to_cute
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    layout,
+    stream,
+    to_cute,
+)
+
 from ..common.policy import batch_table
 from .kernel import KdaSplit
 

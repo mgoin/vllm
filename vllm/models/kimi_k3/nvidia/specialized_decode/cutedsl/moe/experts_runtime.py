@@ -13,7 +13,14 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import check_residency, fake, stream, tensor_maps, to_cute
+from vllm.models.common.specialized_decode.host import (
+    check_residency,
+    fake,
+    stream,
+    tensor_maps,
+    to_cute,
+)
+
 from ..common.policy import batch_table
 from .experts import (
     PLAN_BYTES,

@@ -15,7 +15,14 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, layout, prepare_shared_carveout, stream, to_cute
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    layout,
+    prepare_shared_carveout,
+    stream,
+    to_cute,
+)
+
 from .dcp import (
     compile_value,
     fill_splits,

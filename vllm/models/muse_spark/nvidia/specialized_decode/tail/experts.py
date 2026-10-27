@@ -27,7 +27,7 @@ import torch
 from cutlass import Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     asm,
     no_neg_zero,
 )

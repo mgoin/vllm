@@ -12,8 +12,7 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from .....ops.cute_dsl.latent_moe_tail.primitives import to_cute
-from ...common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     asm,
     bf16,
@@ -43,6 +42,8 @@ from ...common.primitives import (
     warp_sum,
     zeros,
 )
+
+from .....ops.cute_dsl.latent_moe_tail.primitives import to_cute
 from ..routing import Top16Fast, bf16_word, gather_x, score_record, stage_rows
 
 

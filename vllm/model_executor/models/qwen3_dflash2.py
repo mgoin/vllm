@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
+import weakref
 from typing import Any
 
 import torch
@@ -671,19 +673,29 @@ _SPLIT_K_TACTICS: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
     (8192, 7168): ((8, (64, 8, 1, 8)), (16, (64, 16, 1, 8)), (32, (64, 32, 1, 8))),
 }
 
-# Prepared split-K projections by weight address, for the custom op below.
+# Prepared split-K projections by projection id, for the custom op below. The
+# id is minted per switched layer from a monotonic counter and never reused, so
+# a freed layer cannot leave an entry that a later weight (reusing its address)
+# would hit; a finalizer drops the entry with the layer it belongs to. Keying by
+# `weight.data_ptr()` would be unsound: the prepared kernels pin the weight, but
+# another module can reuse the address after the original is freed.
 _SPLIT_K_PROJECTIONS: dict[int, Any] = {}
+_PROJECTION_IDS = itertools.count()
 
 
-def _split_k_linear_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    prepared = _SPLIT_K_PROJECTIONS.get(weight.data_ptr())
+def _split_k_linear_impl(
+    x: torch.Tensor, weight: torch.Tensor, projection: int
+) -> torch.Tensor:
+    prepared = _SPLIT_K_PROJECTIONS.get(projection)
     if prepared is None or x.shape[0] not in prepared.kernels:
         return F.linear(x, weight)
     out = x.new_empty(x.shape[0], weight.shape[0])
     return prepared.run(x.contiguous(), out)
 
 
-def _split_k_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _split_k_linear_fake(
+    x: torch.Tensor, weight: torch.Tensor, projection: int
+) -> torch.Tensor:
     return x.new_empty(x.shape[0], weight.shape[0])
 
 
@@ -695,10 +707,20 @@ direct_register_custom_op(
 
 
 class _SplitKLinearMethod(UnquantizedLinearMethod):
-    """The unquantized method, with decode-sized rows on the split-K GEMM."""
+    """The unquantized method, with decode-sized rows on the split-K GEMM.
 
-    def __init__(self, base: UnquantizedLinearMethod) -> None:
+    Owns its projection and its registry id for as long as the layer lives.
+    """
+
+    def __init__(
+        self,
+        base: UnquantizedLinearMethod,
+        prepared: Any,
+        projection: int,
+    ) -> None:
         self.__dict__.update(base.__dict__)
+        self.prepared = prepared
+        self.projection = projection
 
     def apply(
         self,
@@ -708,19 +730,20 @@ class _SplitKLinearMethod(UnquantizedLinearMethod):
     ) -> torch.Tensor:
         if bias is not None or x.dim() != 2:
             return super().apply(layer, x, bias)
-        return torch.ops.vllm.dflash2_split_k_linear(x, layer.weight)
+        return torch.ops.vllm.dflash2_split_k_linear(x, layer.weight, self.projection)
 
 
 def use_split_k_projections(model: nn.Module) -> int:
     """Route the drafter's decode-sized BF16 projections with a tuned shape to
-    Kimi K3's split-K CuTe GEMM, compiled now so CUDA graph capture only
+    the shared split-K CuTe GEMM, compiled now so CUDA graph capture only
     replays it. Returns the number of projections switched."""
     if envs.VLLM_BATCH_INVARIANT or not current_platform.is_device_capability_family(
         100
     ):
         return 0
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (  # noqa: E501
+    from vllm.models.common.specialized_decode.projection import (
         PreparedProjection,
+        tactic_policies,
     )
 
     switched = 0
@@ -734,14 +757,12 @@ def use_split_k_projections(model: nn.Module) -> int:
             or tuple(weight.shape) not in _SPLIT_K_TACTICS
         ):
             continue
-        policies: dict[int, tuple] = {}
-        first = 1
-        for max_rows, tactic in _SPLIT_K_TACTICS[tuple(weight.shape)]:
-            policies.update(dict.fromkeys(range(first, max_rows + 1), tactic))
-            first = max_rows + 1
+        policies = tactic_policies(_SPLIT_K_TACTICS[tuple(weight.shape)])
         prepared = PreparedProjection(weight, policies).prepare()
-        _SPLIT_K_PROJECTIONS[weight.data_ptr()] = prepared
-        module.quant_method = _SplitKLinearMethod(method)
+        projection = next(_PROJECTION_IDS)
+        _SPLIT_K_PROJECTIONS[projection] = prepared
+        weakref.finalize(module, _SPLIT_K_PROJECTIONS.pop, projection, None)
+        module.quant_method = _SplitKLinearMethod(method, prepared, projection)
         switched += 1
     return switched
 

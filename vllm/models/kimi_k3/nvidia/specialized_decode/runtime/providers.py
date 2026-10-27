@@ -12,8 +12,8 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     shape_dynamic_skinny_gemm,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.models.common.specialized_decode.projection import PreparedProjection
 
-from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.mla.dcp import DcpBox
 from ..cutedsl.mla.prepared import PreparedMla

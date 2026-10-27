@@ -14,7 +14,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     acquire_tensormap,
     alloc,
     bf16,

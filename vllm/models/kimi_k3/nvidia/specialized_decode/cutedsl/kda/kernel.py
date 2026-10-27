@@ -10,7 +10,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.arch import store_async_dsmem
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     asm,
     at,

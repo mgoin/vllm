@@ -22,7 +22,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     asm,
     at,

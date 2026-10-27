@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     bits_float,
     copy_evict,
     float_bits,

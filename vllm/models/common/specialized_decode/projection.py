@@ -12,9 +12,24 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..common.host import architecture, tensor_maps, to_cute
-from ..common.host import stream as current_stream
+from .host import architecture, tensor_maps, to_cute
+from .host import stream as current_stream
 from .splitk import SplitKGemm, SplitKTactic
+
+# A projection tactic: (M tile, N tile, split K, stages).
+Tactic = tuple[int, int, int, int]
+# The tactic serving each padded row count, by the largest row count it serves.
+TacticTable = tuple[tuple[int, Tactic], ...]
+
+
+def tactic_policies(table: TacticTable) -> dict[int, Tactic]:
+    """The tactic of every row count up to the table's largest."""
+    policies: dict[int, Tactic] = {}
+    first = 1
+    for max_rows, tactic in table:
+        policies.update(dict.fromkeys(range(first, max_rows + 1), tactic))
+        first = max_rows + 1
+    return policies
 
 
 def matrix_view(tensor, *, output=False):

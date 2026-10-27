@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     acquire_tensormap,
     alloc,
     asm,
@@ -47,6 +47,7 @@ from ..common.primitives import (
     wait,
     wait_tmem,
 )
+
 from ..common.twoshot import push
 
 shuffle = cute.arch.shuffle_sync
