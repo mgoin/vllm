@@ -72,4 +72,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    if getattr(speculative_config, "draft_lm_head_quantization", None) and not hasattr(
+        dflash_model, "init_candidate_head"
+    ):
+        raise ValueError(
+            "draft_lm_head_quantization with DFlash needs a DFlash2 drafter, "
+            "which uses it to preselect candidates."
+        )
     return dflash_model

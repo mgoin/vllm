@@ -407,10 +407,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_graph_tokens and self._aux_staging is not None:
             assert aux_hidden_states
             start = min(num_tokens, num_graph_tokens)
-            torch.cat(
-                [h[:start] for h in aux_hidden_states],
-                dim=-1,
-                out=self._aux_staging[:start],
+            concat_columns(
+                [h[:start] for h in aux_hidden_states], self._aux_staging[:start]
             )
         if start == num_tokens:
             return
@@ -634,6 +632,70 @@ class DFlashSpeculator(DraftModelSpeculator):
         return self.draft_tokens[:num_reqs]
 
 
+_MAX_CONCAT_INPUTS = 8
+
+
+@triton.jit
+def _concat_columns_kernel(
+    out_ptr,
+    out_stride,
+    in_stride,
+    in0,
+    in1,
+    in2,
+    in3,
+    in4,
+    in5,
+    in6,
+    in7,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    part = tl.program_id(1)
+    cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    src = in0
+    if part == 1:
+        src = in1
+    elif part == 2:
+        src = in2
+    elif part == 3:
+        src = in3
+    elif part == 4:
+        src = in4
+    elif part == 5:
+        src = in5
+    elif part == 6:
+        src = in6
+    elif part == 7:
+        src = in7
+    values = tl.load(src + row.to(tl.int64) * in_stride + cols, mask=mask)
+    out = out_ptr + row.to(tl.int64) * out_stride + part * WIDTH + cols
+    tl.store(out, values.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def concat_columns(inputs: list[torch.Tensor], out: torch.Tensor) -> None:
+    """``torch.cat(inputs, dim=-1, out=out)`` with any cast, in one kernel."""
+    first = inputs[0]
+    rows, width = first.shape
+    if (
+        rows == 0
+        or not first.is_cuda
+        or len(inputs) > _MAX_CONCAT_INPUTS
+        or out.stride(-1) != 1
+        or any(x.shape != first.shape or x.stride() != first.stride() for x in inputs)
+        or first.stride(-1) != 1
+    ):
+        out.copy_(torch.cat(inputs, dim=-1))
+        return
+    padded = inputs + [first] * (_MAX_CONCAT_INPUTS - len(inputs))
+    block = min(1024, triton.next_power_of_2(width))
+    _concat_columns_kernel[(rows, len(inputs), triton.cdiv(width, block))](
+        out, out.stride(0), first.stride(0), *padded, WIDTH=width, BLOCK=block
+    )
+
+
 @triton.jit
 def _prepare_dflash_inputs_kernel(
     # Outputs
@@ -678,6 +740,7 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PAD_BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -806,12 +869,12 @@ def _prepare_dflash_inputs_kernel(
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
             last_query_end = num_reqs * num_query_per_req
-            for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(num_reqs, max_num_reqs + 1, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < max_num_reqs + 1
                 tl.store(out_query_start_loc_ptr + block, last_query_end, mask=mask)
-            for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(num_reqs, max_num_reqs, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < max_num_reqs
                 tl.store(out_seq_lens_ptr + block, 0, mask=mask)
             # Padded sample slots point at query index 0 (a valid row in
@@ -820,8 +883,8 @@ def _prepare_dflash_inputs_kernel(
             # sampling to prevent writing stale values to draft logits.
             pad_start = num_reqs * num_speculative_steps
             pad_end = max_num_reqs * num_speculative_steps
-            for i in range(pad_start, pad_end, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(pad_start, pad_end, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < pad_end
                 tl.store(out_sample_indices_ptr + block, 0, mask=mask)
                 tl.store(out_sample_pos_ptr + block, 0, mask=mask)
@@ -830,8 +893,8 @@ def _prepare_dflash_inputs_kernel(
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(q_pad_start, max_num_tokens, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < max_num_tokens
                 tl.store(out_input_ids_ptr + block, 0, mask=mask)
                 tl.store(out_query_positions_ptr + block, 0, mask=mask)
@@ -924,4 +987,7 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        # One program pads up to max_num_tokens; a BLOCK_SIZE-wide loop over
+        # that span dominated the kernel's runtime.
+        PAD_BLOCK_SIZE=1024,
     )
