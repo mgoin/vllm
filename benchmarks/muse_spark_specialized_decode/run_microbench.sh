@@ -74,6 +74,9 @@ args=(bench forward --model "$MODEL" --language-model-only
   "${case_args[@]}")
 [[ "$EP" == 1 ]] && args+=(--enable-expert-parallel)
 [[ -n "${PROFILE:-}" ]] && args+=(--profile-dir "$PROFILE")
+# AUTOTUNE=0 skips FlashInfer autotuning (minutes of startup per run) for fast
+# kernel iteration; measure with the default (1) before you report numbers.
+if [ "${AUTOTUNE:-1}" = "0" ]; then args+=(--disable-flashinfer-autotune); fi
 [[ -n "${OUT:-}" ]] && args+=(--output-json "$OUT")
 # shellcheck disable=SC2206
 [[ -n "${EXTRA:-}" ]] && args+=($EXTRA)

@@ -34,8 +34,10 @@ done
 f=vllm/third_party/flashmla/flash_mla_interface.py
 if [ ! -e "$DEST/$f" ]; then ln -s "$MAIN/$f" "$DEST/$f"; fi
 
-PYTHONPATH="$DEST" "$MAIN/.venv/bin/python" -c "
-import vllm, vllm.entrypoints.openai.api_server
+# Import check from a neutral cwd, so the editable install of the main checkout
+# cannot mask the worktree.
+cd /tmp
+export PYTHONPATH="$DEST"
+"$MAIN/.venv/bin/python" -c 'import vllm, vllm.entrypoints.openai.api_server
 from vllm.models.muse_spark.nvidia.specialized_decode import specialized_decode_config
-print('worktree ok:', vllm.__file__)
-"
+print("worktree ok:", vllm.__file__)'
