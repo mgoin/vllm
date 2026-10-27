@@ -33,6 +33,27 @@ Per-layer forward, dummy weights, TP4, no EP (`vllm bench forward`, per_layer.py
 | achieved TB/s (stock) | 3.05 | 3.85 | 4.33 | 4.75 | 4.60 | 4.05 |
 | roofline us @7.5 TB/s | 63.5 | 105 | 163 | 219 | 247 | 251 |
 
+### In-situ serving profile at c=16 (128 rows), same 24 steps, rank 0, AV off
+
+| | stock | executor |
+| --- | --- | --- |
+| GPU span | 527 ms | 576 ms |
+| GPU busy | 589 ms | **737 ms** |
+| kernels issued | 37320 | 25967 |
+
+The executor issues 30 % fewer kernels but does **25 % more GPU work** per step. Delta by kernel
+(24 steps): its own kernels appear (+161 ms: `PublishingGemm` 4248 calls 58 ms, `Router` 1440 calls
+47 ms, `QkvKernel` 1488 calls 37 ms, `AllReduceDualNorm` 1488 calls 19 ms), and the stock kernels they
+replace go away (two-shot AR 1776 -> 288 calls, nvjet split-K GEMMs, `dual_norm_kernel`,
+`fused_moe_router`, a 128x32 bf16 GEMM). Net: the fused stages are **slower than stock at 128 rows**:
+router 32.5 us/call at 128 rows (0.26 TB/s of weights), qkv 25 us, publishing GEMM 13.7 us x 2.86/layer,
+plus 31 ms of `bmm_Bfloat16...t128x16` that only the executor runs (the `torch.mm` fallback of
+`DecodeProjection` above its 32/64-row tactic tables).
+
+Action: gate each fused stage to the row range where it is measured to win (qkv, router, o_proj
+boundary), and extend the split-K tactic tables to 256 rows so nothing falls back to cuBLAS. Then the
+experts/tail work has to earn the 32-128-row win on top of parity, not on top of a deficit.
+
 Adaptive verification off, both layouts, same prompts: c=4 stock 14.79 ms vs executor 13.56 ms
 (-8.3 %), c=16 stock 21.45 ms vs executor 21.95 ms (+2.3 %). So the c=16 difference is *not* the
 adaptive-verification balance (that hypothesis is dead) and it is *not* inside the layers (the
