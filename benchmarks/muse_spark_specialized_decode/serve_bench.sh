@@ -4,7 +4,7 @@
 D=${OUT_DIR:-$(pwd)/serve_out}; mkdir -p $D
 export PATH=/home/mgoin/code/vllm/.venv/bin:$PATH
 export PYTHONPATH=${SNAP:-/home/mgoin/code/vllm-muse-sd}
-export HF_HOME=/data/mgoin HF_HUB_OFFLINE=1
+export HF_HOME=${HF_HOME:-/models/mgoin}
 MODEL=meta-models/Muse-Spark-Open-816B-A42B-NVFP4
 PORT=8130
 SPEC='{"method":"dflash","model":"RadixArk/Muse-Spark-Open-DFlash2","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}'

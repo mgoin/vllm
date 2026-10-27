@@ -30,7 +30,7 @@ MODEL=meta-models/Muse-Spark-Open-816B-A42B-NVFP4
 
 export PATH=/home/mgoin/code/vllm/.venv/bin:$PATH
 export PYTHONPATH=${SNAP:-/home/mgoin/code/vllm-muse-sd}
-export HF_HOME=/data/mgoin HF_HUB_OFFLINE=1
+export HF_HOME=${HF_HOME:-/models/mgoin}
 export MUSE_ROUTING=${MUSE_ROUTING:-random}
 
 OVR=$(python - "$LAYERS" <<'EOF'
