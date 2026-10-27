@@ -16,7 +16,29 @@ Base: branch `fork/mgoin/muse-spark-specialized-decode` @ 22ee9766c6, worktree
 - Outside the package: DFlash2 drafter optimizations (fc sharding, fused
   candidate head, FP8 preselection, split-K GEMM) + tests + a docs row.
 
-## Measured (handoff, real weights, B300, TP4)
+## Measured in this environment (real weights, B300, TP4, DFlash2, mixed64 prompts, 1024 out)
+
+| case | stock step / tok/s / AL | specialized step / tok/s / AL | delta |
+| --- | --- | --- | --- |
+| c=1 | 9.52 ms / 437 / 4.31 | 8.02 ms / 538 / 4.40 | -15.8 % step, +23 % tok/s |
+| c=4 | 13.40 ms / 1108 / 4.08 | 11.20 ms / 1243 / 3.64 | -16.4 % step, +12 % tok/s |
+| c=16 | 20.17 ms / 2741 / 3.93 | 20.74 ms / 2773 / 4.05 | +2.8 % step, +1 % tok/s |
+
+Per-layer forward, dummy weights, TP4, no EP (`vllm bench forward`, per_layer.py):
+
+| rows | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock us | 156 | 205 | 282 | 346 | 403 | 466 |
+| executor us | 117 | 162 | 239 | 318 | 385 | 463 |
+| achieved TB/s (stock) | 3.05 | 3.85 | 4.33 | 4.75 | 4.60 | 4.05 |
+| roofline us @7.5 TB/s | 63.5 | 105 | 163 | 219 | 247 | 251 |
+
+The layer-level win fades to nothing by 128 rows, yet the executor's forward at 128 rows is itself
+3 % faster than stock, so the E2E c=16 step is not losing inside the layers: it is the drafter /
+adaptive-verification balance (AL 3.93 -> 4.05 with the step growing by the same 3 %). Confirm with
+adaptive verification off on both layouts before chasing it.
+
+## Handoff numbers (previous agent, same box class)
 
 | case | stock step / tok/s | specialized step / tok/s |
 | --- | --- | --- |
