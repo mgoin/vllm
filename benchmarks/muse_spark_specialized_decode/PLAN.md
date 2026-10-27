@@ -33,10 +33,12 @@ Per-layer forward, dummy weights, TP4, no EP (`vllm bench forward`, per_layer.py
 | achieved TB/s (stock) | 3.05 | 3.85 | 4.33 | 4.75 | 4.60 | 4.05 |
 | roofline us @7.5 TB/s | 63.5 | 105 | 163 | 219 | 247 | 251 |
 
-The layer-level win fades to nothing by 128 rows, yet the executor's forward at 128 rows is itself
-3 % faster than stock, so the E2E c=16 step is not losing inside the layers: it is the drafter /
-adaptive-verification balance (AL 3.93 -> 4.05 with the step growing by the same 3 %). Confirm with
-adaptive verification off on both layouts before chasing it.
+Adaptive verification off, both layouts, same prompts: c=4 stock 14.79 ms vs executor 13.56 ms
+(-8.3 %), c=16 stock 21.45 ms vs executor 21.95 ms (+2.3 %). So the c=16 difference is *not* the
+adaptive-verification balance (that hypothesis is dead) and it is *not* inside the layers (the
+executor's forward at 128 rows measures 3 % faster than stock in `vllm bench forward`). It has to be
+the part of the step outside the target forward: drafter, sampling, or host-side step overhead at
+128 rows. `profile_serve_conc.sh` + `step_span.py` measure exactly that split in situ.
 
 ## Handoff numbers (previous agent, same box class)
 
