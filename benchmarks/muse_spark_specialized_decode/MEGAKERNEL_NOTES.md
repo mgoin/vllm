@@ -170,3 +170,32 @@ stock chain is faster (14.28/22.77 against 11.68/13.19 at 64/128).
 GSM8K, 400 questions: 0.963 stock against 0.950 specialized, no invalid responses
 (one standard error at n=400 is ~1.1 points, so that is a tie; the 1319-question
 run remains the authority at 0.954 against 0.957).
+
+## The decisive test: every non-expert stage is already off the critical path
+
+Instead of building a megakernel to hide the non-expert stages, I measured what
+those stages are worth by *replacing each fused stage with its slower stock
+equivalent* and timing the layer. If a stage is on the critical path, making it
+2-5x slower must show up; if it is hidden behind the weight streams, it will not.
+Six snapshots, one `chg` reservation, `per_layer.py` per layer at 8 and 32 rows:
+
+| snapshot | change | 8 rows | 32 rows | cost of the fused stage |
+| --- | --- | --- | --- | --- |
+| baseline | executor as shipped | 122.9 | 240.3 | — |
+| ab-qkv | fused QKV -> stock qkv GEMM + insert | 123.4 | 241.2 | **+0.5 / +0.9** |
+| ab-router | fused router -> stock TF32 GEMM + routing | 122.6 | 240.9 | **-0.3 / +0.6** |
+| ab-bnd | publishing boundary -> separate AR + dual norm | 123.4 | 241.6 | **+0.5 / +1.3** |
+| ab-tail | fused tail -> stock finalize + unpooler | 122.4 | 240.1 | **-0.5 / -0.2** |
+| ab-exp | persistent experts -> prepared TRT-LLM path | 123.4 | 240.9 | **+0.5 / +0.6** |
+
+Replace *every* fused stage of the layer with a slower implementation and the
+layer moves by at most 1.3 us out of 122.9, i.e. **1 %**. All five stages are
+already hidden behind the weight streams; there is no serial non-expert work for
+a persistent megakernel to overlap, which is the same conclusion the "GPU never
+idle" trace gave, now with a mechanism-independent bound.
+
+Consequence: the executor's 33 us/layer win over stock is *not* the fusions'
+position on the critical path — it is that stock reads and writes more (split-K
+reduce kernels, the permute/stage kernels, the separate qkv insert and its q
+copy). The layer is bound by its two weight streams: 403 MB of experts plus
+151 MB of BF16 dense weights, ~554 MB at ~5.5 TB/s.
