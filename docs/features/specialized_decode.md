@@ -134,8 +134,8 @@ layers: three paired runs put the executor's own high-row path 3.4 % behind stoc
 end to end there even though its forward is 11 us/layer faster, so it hands the
 step back instead.
 
-GSM8K is within noise of stock (0.959 stock, 0.958 specialized on 1319
-questions at concurrency 32).
+GSM8K (5-shot, 1319 questions, concurrency 32, 256-token cap) is at parity:
+0.954 stock against 0.957 specialized, no invalid responses on either side.
 
 The win is at the latency-sensitive batch sizes. As the batch grows the stock
 kernels catch up, which is why the executor's per-stage gates hand stages back
