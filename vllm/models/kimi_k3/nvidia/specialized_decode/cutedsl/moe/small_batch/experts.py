@@ -11,7 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.arch import store_async_dsmem
 
-from ...common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     acquire_tensormap_asm,
     alloc,
     chunk_mma,

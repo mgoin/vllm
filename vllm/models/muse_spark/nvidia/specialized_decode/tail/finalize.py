@@ -49,7 +49,7 @@ from flashinfer.comm.mnnvl_cutedsl.cute_dsl_primitives import (
     store_shared_cluster_f32,
 )
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     add_rn,
     bf16x2,
     fma,

@@ -16,7 +16,52 @@ Base: branch `fork/mgoin/muse-spark-specialized-decode` @ 22ee9766c6, worktree
 - Outside the package: DFlash2 drafter optimizations (fc sharding, fused
   candidate head, FP8 preselection, split-K GEMM) + tests + a docs row.
 
-## Measured (handoff, real weights, B300, TP4)
+## Measured in this environment (real weights, B300, TP4, DFlash2, mixed64 prompts, 1024 out)
+
+| case | stock step / tok/s / AL | specialized step / tok/s / AL | delta |
+| --- | --- | --- | --- |
+| c=1 | 9.52 ms / 437 / 4.31 | 8.02 ms / 538 / 4.40 | -15.8 % step, +23 % tok/s |
+| c=4 | 13.40 ms / 1108 / 4.08 | 11.20 ms / 1243 / 3.64 | -16.4 % step, +12 % tok/s |
+| c=16 | 20.17 ms / 2741 / 3.93 | 20.74 ms / 2773 / 4.05 | +2.8 % step, +1 % tok/s |
+
+Per-layer forward, dummy weights, TP4, no EP (`vllm bench forward`, per_layer.py):
+
+| rows | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock us | 156 | 205 | 282 | 346 | 403 | 466 |
+| executor us | 117 | 162 | 239 | 318 | 385 | 463 |
+| achieved TB/s (stock) | 3.05 | 3.85 | 4.33 | 4.75 | 4.60 | 4.05 |
+| roofline us @7.5 TB/s | 63.5 | 105 | 163 | 219 | 247 | 251 |
+
+### In-situ serving profile at c=16 (128 rows), same 24 steps, rank 0, AV off
+
+| | stock | executor |
+| --- | --- | --- |
+| GPU span | 527 ms | 576 ms |
+| GPU busy | 589 ms | **737 ms** |
+| kernels issued | 37320 | 25967 |
+
+The executor issues 30 % fewer kernels but does **25 % more GPU work** per step. Delta by kernel
+(24 steps): its own kernels appear (+161 ms: `PublishingGemm` 4248 calls 58 ms, `Router` 1440 calls
+47 ms, `QkvKernel` 1488 calls 37 ms, `AllReduceDualNorm` 1488 calls 19 ms), and the stock kernels they
+replace go away (two-shot AR 1776 -> 288 calls, nvjet split-K GEMMs, `dual_norm_kernel`,
+`fused_moe_router`, a 128x32 bf16 GEMM). Net: the fused stages are **slower than stock at 128 rows**:
+router 32.5 us/call at 128 rows (0.26 TB/s of weights), qkv 25 us, publishing GEMM 13.7 us x 2.86/layer,
+plus 31 ms of `bmm_Bfloat16...t128x16` that only the executor runs (the `torch.mm` fallback of
+`DecodeProjection` above its 32/64-row tactic tables).
+
+Action: gate each fused stage to the row range where it is measured to win (qkv, router, o_proj
+boundary), and extend the split-K tactic tables to 256 rows so nothing falls back to cuBLAS. Then the
+experts/tail work has to earn the 32-128-row win on top of parity, not on top of a deficit.
+
+Adaptive verification off, both layouts, same prompts: c=4 stock 14.79 ms vs executor 13.56 ms
+(-8.3 %), c=16 stock 21.45 ms vs executor 21.95 ms (+2.3 %). So the c=16 difference is *not* the
+adaptive-verification balance (that hypothesis is dead) and it is *not* inside the layers (the
+executor's forward at 128 rows measures 3 % faster than stock in `vllm bench forward`). It has to be
+the part of the step outside the target forward: drafter, sampling, or host-side step overhead at
+128 rows. `profile_serve_conc.sh` + `step_span.py` measure exactly that split in situ.
+
+## Handoff numbers (previous agent, same box class)
 
 | case | stock step / tok/s | specialized step / tok/s |
 | --- | --- | --- |
@@ -41,6 +86,63 @@ Bytes a step must stream, per rank and layer:
 
 The step is a pure weight-streaming problem at every batch size. Compute is
 never the limit: even at 128 rows each expert GEMM is M=4.
+
+### The 8-row chain, exclusive critical path per layer (front agent, PROFILE replay)
+
+| stage | us/layer | share |
+| --- | --- | --- |
+| tail experts publish (persistent NVFP4 experts) | 58.2 | 48 % |
+| boundary publish GEMMs (o_proj, pooler, unpooler) | 11.4 | within 1.3x of roofline |
+| fused QKV (qk-norm + rope + kv insert) | 11.1 | ~10 us roofline |
+| router + top-k (side stream) | 8.7 | |
+| o_proj all-reduce + dual norm | 8.6 | latency-bound on the slowest rank |
+| all-gather unpooler + dual norm (FlashInfer) | 7.4 | |
+| tail finalize | 5.4 | |
+| L2 prefetch (side stream) | 4.5 | |
+| attention core | 4.3 | |
+| all-gather pooler + norm + fp4 quant | 0.5 | fully overlapped |
+
+At 16 rows the layer is 164 us and the tail experts share is 61 %. So the chain is not in the
+boundary/attention code: at 8 rows 48 % is the expert stream and the remaining ~70 us is spread over
+ten stages that are each within ~1.3x of their own roofline. The remaining c=1 levers are the expert
+kernel's stream rate, the router's 8.7 us, and the cross-rank wait inside the o_proj boundary.
+
+**Bandwidth calibration (experts agent, nsys + ncu):** a pure streaming read on this box runs at
+5.5-5.8 TB/s (80 % of a 7.66 TB/s peak), and the stock TRT-LLM expert GEMMs reach 5.99 TB/s at 128
+rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
+target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
+
+## Executor kernel profile (8 rows and 128 rows, 8-layer truncated model, TP4, no EP)
+
+Per forward of 8 layers, rank 0 (`vllm bench forward --profile-dir`):
+
+| 8 rows, 1165 us total | us | calls | us/call |
+| --- | --- | --- | --- |
+| PublishingExpertsKernel (persistent NVFP4 experts) | 428 | 7 | 61 |
+| PublishingGemmKernel (o_proj / pooler / unpooler) | 238 | 22 | 10.8 |
+| L2Prefetch (side stream) | 173 | 23 | 7.5 |
+| lm_head GEMM | 145 | 1 | 145 |
+| AllReduceDualNorm (Lamport AR + dual norm) | 128 | 8 | 16.0 |
+| QkvKernel (fused qkv + qk-norm + rope + kv insert) | 122 | 8 | 15.2 |
+| RouterKernel (side stream) | 113 | 7 | 16.1 |
+| attention (trtllm-gen) | 103 | 8 | 12.8 |
+
+| 128 rows, 3783 us total | us | calls | us/call |
+| --- | --- | --- | --- |
+| expert gemm1+swiglu (stock TRT-LLM, gate is <=16 rows) | 1248 | 7 | 178 |
+| expert gemm2 (stock) | 626 | 7 | 89 |
+| lm_head GEMM | 598 | 1 | 598 |
+| PublishingGemmKernel | 300 | 22 | 13.7 |
+| o_proj (torch.mm, above the 64-row tactic) | 300 | 1 | 300 |
+| attention | 227 | 8 | 28.4 |
+| RouterKernel | 203 | 7 | 29.0 |
+| QkvKernel | 202 | 8 | 25.3 |
+| AllGatherDualNorm | 111 | 8 | 13.8 |
+
+Read: at 8 rows the dense projections run at 0.8-1.5 TB/s (10.8 us for 8.4 MB in the o_proj publish, 15 us
+for 19 MB of qkv), the Lamport all-reduce + dual norm costs 16 us, and the L2 prefetch kernels burn 25 us/layer
+of SM time on a side stream. At 128 rows the executor's own kernels are fine, the MoE is still stock
+(the <=16-row gate), and the `PublishingGemmKernel` at 13.7 us for 60.9 MB/layer is ~4.5 TB/s.
 
 ## Critique
 

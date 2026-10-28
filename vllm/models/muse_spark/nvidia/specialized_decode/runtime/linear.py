@@ -4,20 +4,18 @@
 
 cuBLAS runs the decode-sized projections as a split-K GEMM plus a separate
 reduction kernel, without PDL. Up to ``max_rows`` rows, ``DecodeProjection``
-runs Kimi K3's split-K CuTe DSL GEMM instead (FlashInfer's SM100 split-K core
+runs the shared split-K CuTe DSL GEMM instead (FlashInfer's SM100 split-K core
 with a DSMEM reduction and PDL), with a tactic per row count measured on B300
 for each Muse Spark TP4 shape; above that it calls ``torch.mm``.
 """
 
 import torch
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
+from vllm.models.common.specialized_decode.projection import (
     PreparedProjection,
+    TacticTable,
+    tactic_policies,
 )
-
-# (M tile, N tile, split K, stages) by the largest row count it serves.
-Tactic = tuple[int, int, int, int]
-TacticTable = tuple[tuple[int, Tactic], ...]
 
 QKV_TACTICS: TacticTable = (
     (16, (64, 16, 2, 8)),
@@ -41,16 +39,6 @@ UNPOOLER_TACTICS: TacticTable = (
     (32, (64, 32, 2, 8)),
     (64, (64, 64, 2, 5)),
 )
-
-
-def tactic_policies(table: TacticTable) -> dict[int, Tactic]:
-    """The tactic of every row count up to the table's largest."""
-    policies: dict[int, Tactic] = {}
-    first = 1
-    for max_rows, tactic in table:
-        policies.update(dict.fromkeys(range(first, max_rows + 1), tactic))
-        first = max_rows + 1
-    return policies
 
 
 class DecodeProjection:

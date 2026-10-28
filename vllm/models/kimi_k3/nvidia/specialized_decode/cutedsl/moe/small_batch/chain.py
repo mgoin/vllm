@@ -17,7 +17,13 @@ import torch
 from cutlass import Float32, Float64, Int32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
-from ...common.host import fake, layout, stream, to_cute
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    layout,
+    stream,
+    to_cute,
+)
+
 from ...oproj.prepared import OprojMailbox
 from ..tail_runtime import POLL_CAP, compile_tail
 from .experts import ClusterExpertsTP8, ClusterExpertsTP16

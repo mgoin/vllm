@@ -10,9 +10,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32
 
-from ..attn_res.kernel import arm_exchanges, rstd
-from ..common.mailbox import rearm
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     add_rn,
     alloc,
     asm,
@@ -35,7 +33,12 @@ from ..common.primitives import (
     unpack_bf16,
     zeros,
 )
-from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
+from vllm.models.common.specialized_decode.primitives import (
+    wait_phase_zero_cluster as wait_phase_zero,
+)
+
+from ..attn_res.kernel import arm_exchanges, rstd
+from ..common.mailbox import rearm
 from ..common.twoshot import reduce
 from .producer import OprojProducer, pack8, tree_reduce
 

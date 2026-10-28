@@ -5,7 +5,7 @@
 Small decode steps are bound by HBM bandwidth, but some kernels leave it idle:
 the attention core, the collectives and the norms. At fixed points of each
 layer a small kernel on a side stream pulls the byte ranges of the weights the
-next kernels read into L2 (Kimi K3's ``PreparedWeightRanges``), so they start
+next kernels read into L2 (the shared ``PreparedWeightRanges``), so they start
 warm:
 
 - ``attention``: after the QKV projection, this layer's o_proj, read once the
@@ -25,9 +25,7 @@ from functools import partial
 import cuda.bindings.driver as cuda
 import torch
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.prefetch import (
-    PreparedWeightRanges,
-)
+from vllm.models.common.specialized_decode.prefetch import PreparedWeightRanges
 
 # Most rows a prefetch runs for: above it the HBM-bound experts dominate.
 MAX_PREFETCH_ROWS = 64

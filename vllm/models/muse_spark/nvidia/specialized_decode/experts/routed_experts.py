@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark NVFP4 routed experts for decode batches of 1-64 tokens.
+"""Muse Spark NVFP4 routed experts for decode and verify batches of 1-128
+tokens.
 
 Replaces, for one MoE layer, the TRT-LLM-gen chain of
 ``MuseSparkTrtLlmNvFp4Experts.apply_routed`` (routing indices, GEMM1 +
@@ -19,13 +20,17 @@ unweighted); row ``8 t + k`` is route ``(t, k)``, so the permute map is the
 identity and ``route_major`` is set. The same weights, block scales and
 global scales as the stock path are read in place: nothing is repacked.
 
-Each layer owns a 1 KB workspace (the kernel's work and slot counters, which
-it resets itself); the intermediate H and its scales live in a per-device
-scratch shared by all layers, written only after the grid dependency wait.
-Kernels compile when a layer binds (one per activation-tile width: 8, 16, 32
-and 64 tokens) and every launch only passes pointers and scalars, so calls
-can be captured in CUDA graphs with inputs first allocated inside the
-capture.
+The kernel gathers each expert's token rows into a compact activation array
+before the GEMMs (module docstring of ``routed_experts_cute.py``), so one
+kernel serves every row count: the routing table decides the work, not the
+tile width.
+
+Each layer owns a 1.5 KB workspace (the kernel's work, gather and chunk
+counters, which it resets itself); the compact activations, the intermediate
+H and their scales live in per-device scratch shared by all layers, written
+only after the grid dependency wait. The kernel compiles when a layer binds
+and every launch only passes pointers and scalars, so calls can be captured in
+CUDA graphs with inputs first allocated inside the capture.
 """
 
 from __future__ import annotations
@@ -43,26 +48,31 @@ from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from .routed_experts_cute import (
     EXPERTS,
     HIDDEN,
-    HS_SLOT_BYTES,
+    HS_CHUNK_BYTES,
     INTER,
+    MAX_CHUNKS,
+    MAX_CROWS,
     MAX_ROWS,
+    N_COLS,
     TOP_K,
     WS_WORDS,
+    XS_CHUNK_BYTES,
     RoutedExpertsKernel,
 )
 
-TILE_WIDTHS = (8, 16, 32, 64)
-# Pipeline stages per tile width (shared memory: 20 KB + 128 B per token row
-# per stage, plus 32 KB of resident input scales).
-STAGES = {8: 8, 16: 8, 32: 7, 64: 6}
+# Pipeline stages (shared memory: 21 KB per stage, plus 37 KB of resident
+# routing and gather tables).
+STAGES = 8
+# Activation tile widths a kernel is compiled for: one, for every row count.
+# (``tile_width`` stays for callers that ask which tile a call runs with.)
+TILE_WIDTHS = (N_COLS,)
 
 
 def tile_width(rows: int) -> int:
     """The activation-tile width a call of ``rows`` tokens runs with."""
-    for width in TILE_WIDTHS:
-        if rows <= width:
-            return width
-    raise ValueError(f"{rows} rows: at most {MAX_ROWS}")
+    if rows > MAX_ROWS:
+        raise ValueError(f"{rows} rows: at most {MAX_ROWS}")
+    return N_COLS
 
 
 def _pointer(dtype: type[cutlass.Numeric], tensor: torch.Tensor, align: int = 16):
@@ -82,23 +92,24 @@ def _stream():
 
 
 @cache
-def _kernel(device_index: int, width: int, ids_ready: bool):
+def _kernel(device_index: int):
     """``RoutedExpertsKernel`` compiled for a device."""
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            RoutedExpertsKernel(width, ids_ready, STAGES[width]),
+            RoutedExpertsKernel(STAGES),
             _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Float8E4M3FN),
             _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Float8E4M3FN),
             _fake(cutlass.Float4E2M1FN),
-            _fake(cutlass.Uint32),
+            _fake(cutlass.Uint8),
             _fake(cutlass.Int32),
             _fake(cutlass.Float32),
             _fake(cutlass.Float32),
             _fake(cutlass.Float32),
-            _fake(cutlass.Float4E2M1FN),
+            _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Uint8),
+            _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Uint8),
             _fake(cutlass.Int32),
             _fake(cutlass.Uint32),
@@ -109,12 +120,14 @@ def _kernel(device_index: int, width: int, ids_ready: bool):
 
 
 @cache
-def _scratch(device_index: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """H [E * width, 1024] E2M1 (bytes) and its per-slot scale atoms."""
+def _scratch(device_index: int):
+    """The compact activations (rows and scales), H and its scales."""
     device = torch.device("cuda", device_index)
-    h = torch.zeros(EXPERTS * width, INTER // 2, dtype=torch.uint8, device=device)
-    hs = torch.zeros(EXPERTS * HS_SLOT_BYTES, dtype=torch.uint8, device=device)
-    return h, hs
+    xc = torch.zeros(MAX_CROWS * (HIDDEN // 2), dtype=torch.uint8, device=device)
+    xcs = torch.zeros(MAX_CHUNKS * XS_CHUNK_BYTES, dtype=torch.uint8, device=device)
+    h = torch.zeros(MAX_CROWS * (INTER // 2), dtype=torch.uint8, device=device)
+    hs = torch.zeros(MAX_CHUNKS * HS_CHUNK_BYTES, dtype=torch.uint8, device=device)
+    return xc, xcs, h, hs
 
 
 @cache
@@ -210,9 +223,8 @@ class MuseRoutedExperts:
             torch.accelerator.current_device_index() if index is None else index
         )
         self.workspace = torch.zeros(WS_WORDS, dtype=torch.int32, device=w13.device)
-        for width in TILE_WIDTHS:
-            _kernel(self.device_index, width, ids_ready)
-            _scratch(self.device_index, width)
+        _kernel(self.device_index)
+        _scratch(self.device_index)
         _identity(self.device_index)
 
     def __call__(
@@ -234,7 +246,7 @@ class MuseRoutedExperts:
 
         """
         rows = a1q.shape[0]
-        width = tile_width(rows)
+        assert rows <= MAX_ROWS, f"{rows} rows: at most {MAX_ROWS}"
         assert a1q.is_contiguous() and a1q_scale.is_contiguous()
         assert topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
         assert tuple(topk_ids.shape) == (rows, TOP_K)
@@ -242,20 +254,21 @@ class MuseRoutedExperts:
             out = torch.empty(
                 rows * TOP_K, HIDDEN, dtype=torch.bfloat16, device=a1q.device
             )
-        h, hs = _scratch(self.device_index, width)
-        _kernel(self.device_index, width, self.ids_ready)(
+        xc, xcs, h, hs = _scratch(self.device_index)
+        _kernel(self.device_index)(
             _pointer(cutlass.Float4E2M1FN, self.w13, 32),
             _pointer(cutlass.Float8E4M3FN, self.w13_scale),
             _pointer(cutlass.Float4E2M1FN, self.w2, 32),
             _pointer(cutlass.Float8E4M3FN, self.w2_scale),
             _pointer(cutlass.Float4E2M1FN, a1q),
-            _pointer(cutlass.Uint32, a1q_scale),
+            _pointer(cutlass.Uint8, a1q_scale),
             _pointer(cutlass.Int32, topk_ids),
             _pointer(cutlass.Float32, self.g1_alphas),
             _pointer(cutlass.Float32, self.g1_scale_c),
             _pointer(cutlass.Float32, self.g2_alphas),
-            _pointer(cutlass.Float4E2M1FN, h),
-            _pointer(cutlass.Uint8, h),
+            _pointer(cutlass.Float4E2M1FN, xc, 32),
+            _pointer(cutlass.Uint8, xcs),
+            _pointer(cutlass.Float4E2M1FN, h, 32),
             _pointer(cutlass.Uint8, hs),
             _pointer(cutlass.Int32, self.workspace),
             _pointer(cutlass.Uint32, out),

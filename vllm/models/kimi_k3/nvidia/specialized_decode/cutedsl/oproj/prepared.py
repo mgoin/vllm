@@ -17,7 +17,14 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import dynamic_fake, dynamic_view, fake, stream, to_cute
+from vllm.models.common.specialized_decode.host import (
+    dynamic_fake,
+    dynamic_view,
+    fake,
+    stream,
+    to_cute,
+)
+
 from ..common.policy import batch_table
 from .consumer import OprojConsumer, OprojFused
 from .producer import OprojProducer, OprojUmma

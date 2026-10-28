@@ -1,0 +1,4 @@
+vllm:spec_decode_num_drafts_total{engine="0",model_name="meta-models/Muse-Spark-Open-816B-A42B-NVFP4"} 12734.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="meta-models/Muse-Spark-Open-816B-A42B-NVFP4"} 89138.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="meta-models/Muse-Spark-Open-816B-A42B-NVFP4"} 36475.0
+vllm:generation_tokens_total{engine="0",model_name="meta-models/Muse-Spark-Open-816B-A42B-NVFP4"} 49152.0

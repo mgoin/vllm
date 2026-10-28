@@ -30,16 +30,14 @@ orchestration across layers: a stream, events, and per-(point, layer, batch) tab
 built from the model's layers.
 """
 
-import ctypes
 from functools import partial
 
 import cuda.bindings.driver as cuda
 import torch
 
-from ...ops.cute_dsl.latent_moe_tail.primitives import to_cute
-from ..cutedsl.common.host import _checked, resolve_kernel
+from vllm.models.common.specialized_decode.prefetch import PreparedWeightRanges
+
 from ..cutedsl.common.policy import batch_table
-from ..cutedsl.common.prefetch import compile_kernel
 
 # Per-TP batch -> MiB cap (or cap.carveout) of the next layer's attention weights,
 # prefetched once the routed experts finish.
@@ -57,63 +55,6 @@ def attention_weights(attention):
     weights += [getattr(attention, "W_UK_T", None), getattr(attention, "W_UV", None)]
     weights = [w for w in weights if isinstance(w, torch.Tensor)]
     return (*weights, attention.o_proj.weight)
-
-
-class PreparedWeightRanges:
-    """One owner retains weights, immutable range table, executable and launch ABI."""
-
-    def __init__(self, weights, *, byte_cap=0, grid=32, carveout=None, priority=False):
-        self.weights = weights = tuple(weights)
-        device = weights[0].device
-        ranges, remaining = [], byte_cap
-        for weight in weights:
-            if weight.numel() == 0:
-                continue
-            if weight.data_ptr() % 16:  # the kernel walks 16-byte aligned chunks
-                raise ValueError("L2 prefetch ranges must start 16-byte aligned")
-            span = 1 + sum((n - 1) * s for n, s in zip(weight.shape, weight.stride()))
-            size = span * weight.element_size()
-            if byte_cap:
-                size = min(size, remaining) // 16 * 16
-                remaining -= size
-            if size:
-                ranges.append((weight.data_ptr(), size))
-            if byte_cap and remaining < 16:
-                break
-        self.table = torch.tensor(ranges, dtype=torch.int64, device=device)
-        self.compiled = compile_kernel(len(ranges), grid, carveout, device.index)
-        self.config = None
-        if not priority and carveout is None:
-            self.views = to_cute(self.table, 16)
-            return
-        # Launch priority / carveout need a driver launch (CuTe drops both).
-        self.executor, self.function = resolve_kernel(self.compiled, device.index)
-        ids, self.attributes = cuda.CUlaunchAttributeID, []
-        if priority:  # the greatest stream priority
-            top = cuda.CUlaunchAttribute()
-            top.id = ids.CU_LAUNCH_ATTRIBUTE_PRIORITY
-            top.value.priority = _checked(cuda.cuCtxGetStreamPriorityRange())[1]
-            self.attributes.append(top)
-        if carveout is not None:
-            smem = cuda.CUlaunchAttribute()
-            smem.id = ids.CU_LAUNCH_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
-            smem.value.sharedMemCarveout = carveout
-            self.attributes.append(smem)
-        config = self.config = cuda.CUlaunchConfig()
-        config.gridDimX, config.gridDimY, config.gridDimZ = grid, 1, 1
-        config.blockDimX, config.blockDimY, config.blockDimZ = 32, 1, 1
-        config.sharedMemBytes, config.attrs = 0, self.attributes
-        config.numAttrs = len(self.attributes)
-        self.pointer = ctypes.c_void_p(self.table.data_ptr())
-        self.arguments = (ctypes.c_void_p * 1)(ctypes.addressof(self.pointer))
-        self.address = ctypes.addressof(self.arguments)
-
-    def launch(self, stream):
-        if self.config is None:
-            self.compiled(self.views, stream)
-        else:
-            self.config.hStream = stream
-            _checked(cuda.cuLaunchKernelEx(self.config, self.function, self.address, 0))
 
 
 class PrefetchController:

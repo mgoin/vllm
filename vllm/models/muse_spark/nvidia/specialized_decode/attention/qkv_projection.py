@@ -48,6 +48,7 @@ from .primitives import (
     fence_tmem,
     fma,
     free_tmem,
+    load_gmem_i64x2,
     load_shared_f32x4,
     load_shared_i64,
     load_shared_x4,
@@ -58,13 +59,16 @@ from .primitives import (
     mul,
     named_barrier,
     pack_bf16,
+    patch_tensormap,
     rsqrt,
     smem_desc,
     store_global_f32x4,
     store_global_x4,
+    store_gmem_i64x2,
     store_shared_bf16,
     store_shared_i64,
     tensor_map,
+    tensormap_slots,
     thread,
     unpack_bf16,
     wait,
@@ -112,14 +116,15 @@ class QkvKernel:
 
     @cute.jit
     def __call__(
-        self, weight_map, x_map, out, q_out, og_out, kv, positions, slots, cos_sin,
-        workspace,
+        self, weight_map, x_maps, x_states, out, q_out, og_out, kv, positions, slots,
+        cos_sin, workspace,
         m: Int32, eps: Float32, block_size: Int32, s_block: Int64, s_head: Int64,
-        s_token: Int64, stream,
+        s_token: Int64, x_address: Int64, x_pitch: Int64, stream,
     ):  # fmt: skip
         self.kernel(
-            weight_map, x_map, out, q_out, og_out, kv, positions, slots, cos_sin,
-            workspace, m, eps, block_size, s_block, s_head, s_token,
+            weight_map, x_maps, x_states, out, q_out, og_out, kv, positions, slots,
+            cos_sin, workspace, m, eps, block_size, s_block, s_head, s_token,
+            x_address, x_pitch,
         ).launch(
             grid=[self.tiles * PARTS, 1, 1],
             block=[THREADS, 1, 1],
@@ -130,12 +135,15 @@ class QkvKernel:
 
     @cute.kernel
     def kernel(
-        self, weight_map, x_map, out, q_out, og_out, kv, positions, slots, cos_sin,
-        workspace,
+        self, weight_map, x_maps, x_states, out, q_out, og_out, kv, positions, slots,
+        cos_sin, workspace,
         m: Int32, eps: Float32, block_size: Int32, s_block: Int64, s_head: Int64,
-        s_token: Int64,
+        s_token: Int64, x_address: Int64, x_pitch: Int64,
     ):  # fmt: skip
         tid, warp, _, cta = thread()
+        # This CTA's copy of the input's descriptor: pointed at the call's input
+        # here, so a captured call copies nothing from the host.
+        x_map = x_maps.iterator + cta * 128
         half, pair = cta % 2, cta // 2
         part = pair % PARTS
         tile = pair // PARTS * 2 + half
@@ -152,19 +160,25 @@ class QkvKernel:
         owns = part * width < m
 
         if tid == 0:
+            # Whether this CTA's descriptor already points at this input; its
+            # load hides behind the mbarrier setup.
+            patched_address, patched_rows = load_gmem_i64x2(x_states.iterator + cta * 2)
             for s in cutlass.range_constexpr(stages):
                 cute.arch.mbarrier_init(full + s, 1)
                 cute.arch.mbarrier_init(empty + s, 2)  # both CTAs' MMAs
             cute.arch.mbarrier_init(done, 1)
             cute.arch.mbarrier_init_fence()
             acquire_tensormap(weight_map.iterator)
-            acquire_tensormap(x_map.iterator)
             # The weights do not depend on the predecessor: the first ring now.
             for kb in cutlass.range_constexpr(stages):
                 cute.arch.mbarrier_arrive_and_expect_tx(full + kb, stage)
                 column = k0 + kb * BLOCK_K
                 w = weight_map.iterator
                 load_tma2(ring + kb * stage, w, full + kb, column, row0)
+            if (patched_address != x_address) | (patched_rows != Int64(m)):
+                patch_tensormap(x_map, x_address, m, x_pitch, box=self.tile // 2)
+                store_gmem_i64x2(x_states.iterator + cta * 2, x_address, Int64(m))
+            acquire_tensormap(x_map)
         if warp == 4:
             cute.arch.alloc_tmem(self.columns, tmem_slot.iterator)
             cute.arch.relinquish_tmem_alloc_permit()
@@ -207,7 +221,7 @@ class QkvKernel:
     def produce(self, weight_map, x_map, ring, full, empty, k0, row0, half):
         """Thread 0: the weight blocks past the first ring and this CTA's half of
         every block's activation rows (rows past m read as zeros), multicast to
-        the pair."""
+        the pair. ``x_map`` is this CTA's patched input descriptor."""
         stages, stage = self.stages, self.stage
         rows: cutlass.Constexpr = self.tile // 2
         for kb in cutlass.range(self.blocks, unroll=1):
@@ -219,7 +233,7 @@ class QkvKernel:
                 cute.arch.mbarrier_arrive_and_expect_tx(full + s, stage)
                 load_tma2(tile, weight_map.iterator, full + s, column, row0)
             dst = tile + A_BYTES + half * (rows * BLOCK_K * 2)
-            load_tma2_multicast(dst, x_map.iterator, full + s, column, half * rows, 3)
+            load_tma2_multicast(dst, x_map, full + s, column, half * rows, 3)
 
     @cute.jit
     def multiply(self, ring, full, empty, done, tmem):
@@ -405,6 +419,9 @@ def compile_qkv(tile, num_heads, num_kv_heads, hidden, rope, kv_out, device_inde
     def descriptor():
         return make_fake_tensor(Uint8, (128,), (1,), assumed_align=64)
 
+    def maps():
+        return make_fake_tensor(Uint8, (sym(), 128), (128, 1), assumed_align=128)
+
     def rows(width):
         stride = (sym(divisibility=8), 1)
         return make_fake_tensor(BFloat16, (sym(), width), stride, assumed_align=16)
@@ -412,10 +429,11 @@ def compile_qkv(tile, num_heads, num_kv_heads, hidden, rope, kv_out, device_inde
     q_width = num_heads * HEAD
     table = make_fake_tensor(Float32, (sym(), HEAD), (HEAD, 1), assumed_align=16)
     args = (
-        descriptor(), descriptor(), rows(sym()), rows(q_width), rows(q_width),
-        flat(BFloat16), flat(Int64, 8),
-        flat(Int64, 8), table, flat(Float32), Int32(1), Float32(1e-5), Int32(16),
-        Int64(0), Int64(0), Int64(0), make_fake_stream(use_tvm_ffi_env_stream=True),
+        descriptor(), maps(), flat(Int64), rows(sym()), rows(q_width),
+        rows(q_width), flat(BFloat16), flat(Int64, 8), flat(Int64, 8), table,
+        flat(Float32), Int32(1), Float32(1e-5), Int32(16),
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
     )  # fmt: skip
     kernel = QkvKernel(tile, num_heads, num_kv_heads, hidden, rope, kv_out)
     with torch.accelerator.device_index(device_index):
@@ -430,19 +448,6 @@ def mailboxes(device: torch.device, n: int) -> torch.Tensor:
     words = (n // ROWS) * PARTS * (PARTS - 1) * (MAX_ROWS // PARTS) * ROWS
     empty = torch.full((words,), -1, dtype=torch.int32, device=device)
     return empty.view(torch.float32)
-
-
-_X_MAPS: dict[tuple, torch.Tensor] = {}
-
-
-def _x_map(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """TMA map of ``x`` with [rows, 64] boxes, cached by address and shape (the
-    decode inputs are pointer-stable)."""
-    key = (x.data_ptr(), tuple(x.shape), x.stride(0), rows, x.device)
-    descriptor = _X_MAPS.get(key)
-    if descriptor is None:
-        descriptor = _X_MAPS[key] = tensor_map(x, (BLOCK_K, rows))
-    return descriptor
 
 
 class QkvProjection:
@@ -470,6 +475,15 @@ class QkvProjection:
         self.hidden = weight.shape[1]
         self.device = weight.device
         self.weight_map = tensor_map(weight, (BLOCK_K, ROWS))
+        # One descriptor per launching CTA, prepared here: each CTA points its own
+        # at the call's input, so a captured replay copies nothing.
+        ctas = 2 * (num_heads + num_kv_heads) * HEAD // ROWS * PARTS
+        self.x_maps = tensormap_slots(
+            weight, (self.hidden, MAX_ROWS), (BLOCK_K, ROWS), ctas
+        )
+        # Per CTA, the (address, rows) its descriptor copy was last pointed at:
+        # an unchanged input skips the patch and its release fence.
+        self.x_states = torch.zeros(2 * ctas, dtype=torch.int64, device=self.device)
         self.mailboxes = mailboxes(self.device, n)
         self.no_rope_table = torch.zeros(1, HEAD, device=self.device)
 
@@ -531,13 +545,17 @@ class QkvProjection:
         assert (cos_sin_cache is not None) == self.rope
         assert kv_cache.dim() == 4 and kv_cache.stride(3) == 1
         assert kv_cache.shape[1] == self.num_kv_heads and kv_cache.shape[3] == 2 * HEAD
+        assert x.dtype == torch.bfloat16 and x.stride(1) == 1
+        x_pitch = x.stride(0) * x.element_size()
+        assert x.data_ptr() % 128 == 0 and x_pitch % 16 == 0
         table = cos_sin_cache if cos_sin_cache is not None else self.no_rope_table
         assert table.dtype == torch.float32 and table.shape[1] == HEAD
         base = torch.as_strided(kv_cache, (2 * HEAD,), (1,))
         self.kernel(m, out is not None)(
-            self.weight_map, _x_map(x, row_tile(m) // 2),
+            self.weight_map, self.x_maps, self.x_states,
             q_out if out is None else out, q_out, og_out, base, positions,
             slot_mapping, table, self.mailboxes, m, self.eps, kv_cache.shape[2],
             kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            x.data_ptr(), x_pitch,
         )  # fmt: skip
         return out

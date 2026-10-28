@@ -23,8 +23,10 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.host import (
+    fake,
+)
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     at,
     bf16x2,

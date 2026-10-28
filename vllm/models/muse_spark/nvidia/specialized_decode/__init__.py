@@ -5,12 +5,18 @@ the stock text backbone, enabled by
 ``additional_config={"decode_backend": "latency_specialized"}``.
 
 The executor runs FULL-graph decode and verify steps; every other step runs the
-stock forward. It issues cross-rank collectives, so the deployment check below
+stock forward. ``vllm bench forward`` captures its own FULL graphs through the
+external launcher with vLLM CUDA graphs and ``torch.compile`` off, which is the
+one accepted no-graphs deployment; a serving deployment with CUDA graphs off,
+including ``--enforce-eager``, is rejected at startup rather than silently
+running stock. It issues cross-rank collectives, so the deployment check below
 is collective over the TP group and every per-step decision reads host state
 that all TP ranks share.
 """
 
+import importlib.metadata
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 import torch.distributed as dist
@@ -21,12 +27,20 @@ from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
-# Rows of the largest step the executor runs: 32 requests verifying 8 tokens
-# each. Larger decode steps run the stock layers.
-MAX_ROWS = 256
+# Rows of the largest step the executor runs: 8 requests verifying 8 tokens
+# each. Above it the stock layers are at least as fast today: at 128 rows the
+# executor's own fused stages (all-reduce + dual norm, router, qkv) cost more
+# than the stock kernels they replace, and the end-to-end step is 2.3-2.8 %
+# slower (measured at concurrency 16, with and without adaptive verification).
+# Raise it only with a measurement that beats stock at 128 rows.
+MAX_ROWS = 64
+# The flashinfer-python that requirements/cuda.txt pins. The executor calls
+# FlashInfer's mnnvl_cutedsl internals and reads its attention metadata.
+FLASHINFER_VERSION = "0.7.2.post1"
 
 
 @dataclass(frozen=True)
@@ -34,6 +48,15 @@ class DecodeConfig:
     # Tune the executor's FlashInfer kernels at build
     # (kernel_config.enable_flashinfer_autotune is not False).
     autotune: bool
+
+
+@cache
+def _flashinfer_version() -> str | None:
+    """The installed flashinfer-python version, or None."""
+    try:
+        return importlib.metadata.version("flashinfer-python")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _has_multicast() -> bool:
@@ -68,14 +91,38 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
         "an NVFP4 (modelopt_fp4) checkpoint": isinstance(
             vllm_config.quant_config, ModelOptNvFp4Config
         ),
-        "the default MoE backend (not deep_gemm_mega_moe)": (
-            vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe"
+        # The prepared-NVFP4 experts need the resolved FlashInfer TRT-LLM
+        # backend; `auto` is checked again against the built layers.
+        "the FlashInfer TRT-LLM NVFP4 MoE backend (moe_backend auto or "
+        "flashinfer_trtllm)": (
+            vllm_config.kernel_config.moe_backend in ("auto", "flashinfer_trtllm")
         ),
-        # Without CUDA graphs every step runs the stock layers; benchmarks that
-        # capture their own graphs (vllm bench forward) still run the executor.
-        "FULL CUDA graphs for decode batches, or none": (
-            cudagraph_mode is not None
-            and cudagraph_mode.decode_mode() in (CUDAGraphMode.FULL, CUDAGraphMode.NONE)
+        # Auto is checked again against the built attention layers.
+        "the FLASHINFER attention backend (or auto resolving to it)": (
+            vllm_config.attention_config.backend
+            in (None, AttentionBackendEnum.FLASHINFER)
+        ),
+        f"flashinfer-python {FLASHINFER_VERSION} (found {_flashinfer_version()})": (
+            _flashinfer_version() == FLASHINFER_VERSION
+        ),
+        # The executor runs only inside a FULL graph capture. vllm bench forward
+        # (the external launcher) captures its own graphs with vLLM CUDA graphs
+        # and torch.compile off; a serving deployment that turns both off would
+        # silently run stock.
+        "FULL CUDA graphs for decode batches (FULL_AND_PIECEWISE or "
+        "FULL_DECODE_ONLY), or the external-capture benchmark mode (no CUDA "
+        "graphs and no torch.compile)": (
+            (
+                cudagraph_mode is not None
+                and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            )
+            or (
+                cudagraph_mode is not None
+                and cudagraph_mode.decode_mode() == CUDAGraphMode.NONE
+                and compilation.mode == CompilationMode.NONE
+                and not vllm_config.model_config.enforce_eager
+                and parallel.distributed_executor_backend == "external_launcher"
+            )
         ),
         # The decode loop runs in forward; a compiled forward would trace it.
         "no torch.compile of the model": (
@@ -117,11 +164,6 @@ def specialized_decode_config(vllm_config: VllmConfig) -> DecodeConfig | None:
         "%d rows.",
         MAX_ROWS,
     )
-    if vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-        logger.warning_once(
-            "Muse Spark specialized decode runs only in CUDA graph captures, "
-            "and CUDA graphs are off."
-        )
     return DecodeConfig(
         autotune=vllm_config.kernel_config.enable_flashinfer_autotune is not False
     )

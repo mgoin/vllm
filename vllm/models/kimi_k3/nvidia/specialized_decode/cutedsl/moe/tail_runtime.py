@@ -17,7 +17,14 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to_cute
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    prepare_shared_carveout,
+    stream,
+    tensor_maps,
+    to_cute,
+)
+
 from ..common.policy import batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox

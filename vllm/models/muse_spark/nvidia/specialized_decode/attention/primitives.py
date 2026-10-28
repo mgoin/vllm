@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint16, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -105,6 +105,17 @@ def empty_word(words):
 def acquire_tensormap(pointer):
     code = "fence.proxy.tensormap::generic.acquire.sys [$0],128; "
     return code + "prefetch.tensormap [$0];", "l", (pointer,)
+
+
+@asm((Int64, Int64))
+def load_gmem_i64x2(pointer):
+    """The two int64 words at ``pointer`` (one 16-byte load)."""
+    return "ld.global.v2.b64 {$0,$1},[$2];", "=l,=l,l,~{memory}", (pointer,)
+
+
+@asm()
+def store_gmem_i64x2(pointer, first, second):
+    return "st.global.v2.b64 [$0],{$1,$2};", "l,l,l,~{memory}", (pointer, first, second)
 
 
 @asm()
@@ -289,21 +300,17 @@ def rsqrt(x):
     return "rsqrt.approx.f32 $0,$1;", "=f,f", (Float32(x),)
 
 
-_PINNED_MAPS: list[torch.Tensor] = []
-
-
-def tensor_map(tensor, box):
-    """Device TMA descriptor of a BF16 [rows, K] matrix (row pitch kept): 128B
-    swizzle, ``box`` = (K elements, rows)."""
-    rows, k = tensor.shape
-    dims = [cuda.cuuint64_t(v) for v in (k, rows)]
-    pitch = [cuda.cuuint64_t(tensor.stride(0) * tensor.element_size())]
+def encode_tensor_map(address, dims, pitch, box):
+    """The 128 host bytes of a BF16 2D TMA descriptor (128B swizzle) of a matrix
+    with ``dims`` (elements, innermost first), row ``pitch`` (bytes) and ``box``
+    (elements, innermost first). No device work: the bytes are encoded here and
+    uploaded where they live for good."""
     status, descriptor = cuda.cuTensorMapEncodeTiled(
         cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         2,
-        tensor.data_ptr(),
-        dims,
-        pitch,
+        address,
+        [cuda.cuuint64_t(v) for v in dims],
+        [cuda.cuuint64_t(pitch)],
         [cuda.cuuint32_t(v) for v in box],
         [cuda.cuuint32_t(1)] * 2,
         cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -314,9 +321,49 @@ def tensor_map(tensor, box):
     if status != cuda.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cuTensorMapEncodeTiled failed: {status}")
     encoded = bytes((ctypes.c_ubyte * 128).from_address(descriptor.getPtr()))
-    # Pinned and kept alive: a map made during CUDA graph capture is a captured
-    # copy that every replay repeats.
-    host = torch.empty(128, dtype=torch.uint8, pin_memory=True)
-    host.copy_(torch.frombuffer(bytearray(encoded), dtype=torch.uint8))
-    _PINNED_MAPS.append(host)
-    return host.to(tensor.device, non_blocking=True)
+    return encoded
+
+
+def upload(bytes_, device):
+    """``bytes_`` as a [128] uint8 device tensor: one pageable copy, at bind."""
+    return torch.frombuffer(bytearray(bytes_), dtype=torch.uint8).to(device)
+
+
+def tensor_map(tensor, box):
+    """Device TMA descriptor of a BF16 [rows, K] matrix (row pitch kept): 128B
+    swizzle, ``box`` = (K elements, rows).
+
+    Call it at bind time only (the weights and the row tiles are fixed then):
+    a descriptor first built inside a capture is a host->device copy the graph
+    replays, and one built per call leaks its pinned staging buffer."""
+    rows, k = tensor.shape
+    pitch = tensor.stride(0) * tensor.element_size()
+    return upload(
+        encode_tensor_map(tensor.data_ptr(), (k, rows), pitch, box), tensor.device
+    )
+
+
+def tensormap_slots(anchor, dims, box, slots):
+    """``slots`` device copies of the descriptor of a BF16 [rows, K] input matrix,
+    one per launching CTA: ``dims`` / ``box`` placeholders, the row pitch of
+    ``anchor`` (any device tensor of that dtype: an address only has to be one
+    the encoder accepts).
+
+    Each CTA points its own copy at the call's input with ``patch_tensormap`` and
+    prefetches it, so a descriptor is prepared once and no captured call copies
+    one from the host or allocates one."""
+    pitch = anchor.stride(0) * anchor.element_size()
+    encoded = encode_tensor_map(anchor.data_ptr(), dims, pitch, box)
+    return upload(encoded, anchor.device).unsqueeze(0).expand(slots, 128).contiguous()
+
+
+@asm()
+def patch_tensormap(pointer, address, rows, pitch, *, box):
+    """Point a prepared BF16 input descriptor at ``address``: ``rows`` rows of
+    ``pitch`` bytes, ``box`` rows per TMA box."""
+    code = "tensormap.replace.tile.global_address.global.b1024.b64 [$0],$1; "
+    code += "tensormap.replace.tile.global_dim.global.b1024.b32 [$0],1,$2; "
+    code += "tensormap.replace.tile.global_stride.global.b1024.b64 [$0],0,$3; "
+    code += f"tensormap.replace.tile.box_dim.global.b1024.b32 [$0],1,{box}; "
+    code += "fence.proxy.tensormap::generic.release.gpu;"
+    return code, "l,l,r,l,~{memory}", (pointer, address, Int32(rows), pitch)

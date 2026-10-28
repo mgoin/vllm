@@ -41,6 +41,7 @@ from vllm.models.muse_spark.nvidia.ops.prepare_trtllm_nvfp4 import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from ...model import (
     MuseSpark1xColumnShardedStream,
@@ -87,6 +88,12 @@ class DecodeStep(NamedTuple):
 
 # Most rows of the published unpooler; above it the stock all-gather is as fast.
 UNPOOLER_MAX_ROWS = 128
+
+# The experts kernel took one 8-column tile width and a 16-pointer signature;
+# `tail/experts.py` still subclasses it with the previous shape, so the fused
+# tail waits for its rebind. Off, the layers run the plain expert kernel and
+# keep the stock finalize and unpooler: correct, just not fused.
+TAIL_BOUND = False
 
 
 @dataclass(slots=True)
@@ -242,10 +249,22 @@ EXPERTS_ROWS = range(2, 17)
 def routed_experts(moe: MuseSpark1xMoE) -> "MuseRoutedExperts | None":
     """The persistent routed experts of an NVFP4 MoE layer, which read the
     routing that the aux stream finished."""
+    from ...muse_moe_runner import MuseSparkModelOptNvFp4FusedMoE
     from ..experts.routed_experts import MuseRoutedExperts, build_routed_experts
 
     experts = build_routed_experts(moe.experts, ids_ready=True)
-    return experts if isinstance(experts, MuseRoutedExperts) else None
+    if isinstance(experts, MuseRoutedExperts):
+        return experts
+    # BF16 layers keep the stock experts; an NVFP4 layer without the prepared
+    # TRT-LLM kernel would silently run a mixed path (or assert in the runner).
+    if isinstance(
+        moe.experts.routed_experts.quant_method, MuseSparkModelOptNvFp4FusedMoE
+    ):
+        raise ValueError(
+            "decode_backend=latency_specialized needs the resolved FlashInfer "
+            f"TRT-LLM NVFP4 MoE backend for every NVFP4 layer: {experts}."
+        )
+    return None
 
 
 class LayerPlan(NamedTuple):
@@ -316,6 +335,11 @@ class SpecializedDecode:
                     "decode_backend=latency_specialized needs FlashInfer's "
                     "rmsnorm_sigmoid_gate for the attention output gate"
                 )
+            if attn.attn.backend != AttentionBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "decode_backend=latency_specialized needs the FLASHINFER "
+                    f"attention backend, not {attn.attn.backend.name}."
+                )
         rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         self.plans = []
@@ -348,13 +372,7 @@ class SpecializedDecode:
             )
         self.boundaries = Boundaries(self.layers)
         self.tail = self._build_tail(backbone.aux_hidden_state_layers)
-        import os  # DEBUG A/B
-
-        self.prefetch = (
-            PrefetchController(self.plans)
-            if os.environ.get("MUSE_SD_PREFETCH", "1") == "1"
-            else None
-        )
+        self.prefetch = PrefetchController(self.plans)
         # One layer per attention KV-cache group is enough, but the names are
         # few and every one is checked.
         self._layer_names = [layer.self_attn.attn.layer_name for layer in self.layers]
@@ -365,12 +383,9 @@ class SpecializedDecode:
         """The fused MoE tail and the publishing experts of the layers it
         serves: NVFP4 layers whose FFN branch goes to the next boundary rather
         than to the draft model's aux hidden states."""
-        import os  # DEBUG A/B
-
-        if (
-            self.boundaries.unpooler is None
-            or os.environ.get("MUSE_SD_TAIL", "1") != "1"
-        ):
+        if self.boundaries.unpooler is None:
+            return None
+        if not TAIL_BOUND:
             return None
         from ..tail.experts import PublishingRoutedExperts
         from ..tail.tail import MoeTail, layer_parities
@@ -406,6 +421,21 @@ class SpecializedDecode:
                 tail_parity=parity,
             )
         return tail
+
+    def rearm(self) -> None:
+        """Re-arm the mailboxes and stage state after the memory-profiling
+        capture, which runs against a throwaway KV cache.
+
+        ``initialize_kv_cache`` calls this before the real capture, so the
+        executor starts from the state of a fresh one. The resets synchronize
+        the TP group, and ``initialize_kv_cache`` is collective over it.
+        """
+        self.boundaries.attention.reset()
+        for publisher in (self.boundaries.pooler, self.boundaries.unpooler):
+            if publisher is not None:
+                publisher.reset()
+        if self.tail is not None:
+            self.tail.reset()
 
     def plan(
         self,
@@ -449,8 +479,7 @@ class SpecializedDecode:
             output = self._final_norm(state)
         finally:
             # A capture must end joined, also when it raises.
-            if self.prefetch is not None:
-                self.prefetch.join()
+            self.prefetch.join()
         if aux:
             return output, aux
         return output
@@ -470,10 +499,7 @@ class SpecializedDecode:
         rows = attn_output.shape[0]
         wants_router = moe.wants_fp32_router_input(rows)
         attn = layer.self_attn
-        import os  # DEBUG bisect
-
-        dbg = os.environ.get("MUSE_SD_BND", "ar,pool,unpool").split(",")
-        if rows <= self.boundaries.o_proj_max_rows and "ar" in dbg:
+        if rows <= self.boundaries.o_proj_max_rows:
             boundary = self.boundaries.attention
             # The boundary applies the output gate, in the GEMM for few rows.
             handle = boundary.o_proj(attn_output, attn.o_proj.weight, gate=og)
@@ -516,8 +542,7 @@ class SpecializedDecode:
             )
         local_columns = layer._defers_column_gather(rows)
         publish = (
-            "unpool" in dbg
-            and may_publish
+            may_publish
             and local_columns
             and rows <= UNPOOLER_MAX_ROWS
             and self.boundaries.unpooler is not None
@@ -587,15 +612,9 @@ class SpecializedDecode:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """The fused QKV projection's ``(q, o_gate)`` with the KV cache written,
         or None to run it unfused."""
-        import os  # DEBUG A/B
-
         fused = plan.qkv_fused
         rows = attn_input.shape[0]
-        if (
-            fused is None
-            or rows > QKV_FUSED_MAX_ROWS
-            or os.environ.get("MUSE_SD_QKV", "1") != "1"
-        ):
+        if fused is None or rows > QKV_FUSED_MAX_ROWS:
             return None
         attn = plan.layer.self_attn
         _, _, kv_cache, slot_mapping = get_attention_context(attn.attn.layer_name)
@@ -626,14 +645,11 @@ class SpecializedDecode:
     ) -> torch.Tensor:
         """``MuseMoERunner.forward_prepared_nvfp4``, on the persistent routed
         experts where they serve the step."""
-        import os  # DEBUG A/B
-
         runner = plan.moe.experts
         if (
             plan.experts is None
             or not isinstance(routing, tuple)
             or a1q.shape[0] not in EXPERTS_ROWS
-            or os.environ.get("MUSE_SD_EXPERTS", "1") != "1"
         ):
             return runner.forward_prepared_nvfp4(a1q, a1q_scale, routing)
         topk_ids, topk_weights = routing
@@ -676,13 +692,7 @@ class SpecializedDecode:
         pooler_publisher = self.boundaries.pooler
 
         def pool_and_quantize() -> tuple[torch.Tensor, torch.Tensor]:
-            import os  # DEBUG bisect
-
-            if (
-                moe.shards_pooler(num_tokens)
-                and pooler_publisher is not None
-                and "pool" in os.environ.get("MUSE_SD_BND", "ar,pool,unpool")
-            ):
+            if moe.shards_pooler(num_tokens) and pooler_publisher is not None:
                 handle = pooler_publisher(hidden_states, plan.pooler.weight)
                 return pooler_publisher.rmsnorm_fp4_quantize(
                     handle,
@@ -708,11 +718,8 @@ class SpecializedDecode:
             )
 
         def route() -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            import os  # DEBUG A/B
-
             if (
                 plan.router is not None
-                and os.environ.get("MUSE_SD_ROUTER", "1") == "1"
                 and num_tokens in ROUTER_ROWS
                 and router_input.dtype == torch.bfloat16
             ):
@@ -735,15 +742,12 @@ class SpecializedDecode:
             moe._router_events[1],
             moe._router_aux_stream,
         )
-        import os  # DEBUG A/B
-
         if (
             publish
             and self.tail is not None
             and plan.tail_experts is not None
             and isinstance(routing, tuple)
             and self.tail.supports(num_tokens)
-            and os.environ.get("MUSE_SD_TAIL", "1") == "1"
         ):
             parity = plan.tail_parity
             unfinalized = plan.tail_experts(

@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 EXPERTS, HIDDEN, INTER, TOP_K = 256, 4096, 1024, 8
-ROWS = (1, 2, 4, 8, 16, 32, 64)
+ROWS = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def _nvfp4(w: torch.Tensor, global_scale: torch.Tensor):
@@ -233,7 +233,7 @@ def test_matches_stock(layer, experts, m, routing):
 def test_ids_ready_matches(layer):
     """The variant that reads the routing before its grid dependency wait."""
     experts = _kernel(layer, ids_ready=True)
-    for m in (3, 8, 40):
+    for m in (3, 8, 40, 128):
         a1q, a1q_scale, ids, weights = inputs(layer, m, "uniform", seed=100 + m)
         result = run(experts, a1q, a1q_scale, ids, weights)
         ref = stock(layer, a1q, a1q_scale, ids, weights)
@@ -243,7 +243,9 @@ def test_ids_ready_matches(layer):
 def test_back_to_back_calls(layer, experts):
     """The kernel resets its workspace: calls of every tile width in a row,
     without synchronizing, each match their own reference."""
-    cases = [inputs(layer, m, "uniform", seed=200 + m) for m in (64, 1, 16, 9, 33)]
+    cases = [
+        inputs(layer, m, "uniform", seed=200 + m) for m in (128, 1, 16, 9, 33, 64)
+    ]
     results = [run(experts, *case) for case in cases]
     for case, result in zip(cases, results):
         ref = stock(layer, *case)
@@ -254,7 +256,7 @@ def test_cuda_graph_replay(layer, experts):
     """Captured per row count, replayed on new inputs in the same buffers,
     interleaved."""
     graphs = {}
-    for m in (1, 8, 64):
+    for m in (1, 8, 128):
         case = inputs(layer, m, "uniform", seed=300 + m)
         out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda")
         experts(*case, out)  # warm up
@@ -348,7 +350,7 @@ def _robustness_main():
     layer = make_layer()
     experts = _kernel(layer)
     assert isinstance(experts, MuseRoutedExperts)
-    for m in range(1, 33):
+    for m in list(range(1, 33)) + [40, 64, 128]:
         for case in _degenerate_cases(layer, m, seed=500 + m):
             ids = case[2]
             got = run(experts, case[0], case[1], ids.cuda(), case[3])
@@ -356,7 +358,7 @@ def _robustness_main():
             torch.testing.assert_close(got.gemm2_permuted, expected, atol=0, rtol=0)
     # NaN input scales (E4M3 0x7F) on the first token: the same rows as the
     # stock kernel, bit for bit (H's saturating quantization keeps them finite).
-    for m in (1, 8, 32):
+    for m in (1, 8, 32, 128):
         a1q, a1q_scale, ids, weights = inputs(layer, m, "uniform", seed=600 + m)
         a1q_scale[0] = 0x7F
         got = run(experts, a1q, a1q_scale, ids, weights).gemm2_permuted
@@ -386,8 +388,9 @@ def _robustness_main():
 def test_degenerate_routing_completes():
     """Invalid ids (-1, 256, 1000, INT_MIN) give zero rows, an expert repeated
     within a token gives each route the expert's row, all tokens on one or two
-    experts, NaN input scales; M = 1..32, eager and graph replays back to back
-    across widths. A hang fails the test after the timeout."""
+    experts, NaN input scales; M = 1..32 and 40/64/128 (one expert holding 128
+    tokens is 16 chunks), eager and graph replays back to back. A hang fails
+    the test after the timeout."""
     env = dict(os.environ, VLLM_MUSE_EXPERTS_SPIN_LIMIT="200000000")
     result = subprocess.run(
         [sys.executable, __file__],

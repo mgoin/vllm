@@ -12,10 +12,12 @@ import torch
 from cutlass import Int32, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, stream, to_cute
-from ..common.mailbox import poll, rearm
-from ..common.policy import batch_table
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    stream,
+    to_cute,
+)
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     asm,
     bits_float,
@@ -27,7 +29,10 @@ from ..common.primitives import (
     store_words,
     view,
 )
-from ..gemm.projection import PreparedProjection
+from vllm.models.common.specialized_decode.projection import PreparedProjection
+
+from ..common.mailbox import poll, rearm
+from ..common.policy import batch_table
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .shared import compile_down, compile_shared, situ, weight_maps

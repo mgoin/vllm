@@ -25,8 +25,11 @@ import torch
 from cutlass import Constexpr, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, tensor_maps
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.host import (
+    fake,
+    tensor_maps,
+)
+from vllm.models.common.specialized_decode.primitives import (
     acquire_tensormap,
     alloc,
     asm,
@@ -57,6 +60,7 @@ from ..common.primitives import (
     view,
     wait,
 )
+
 from ..gemm.ws_gemm import positive_zero, positive_zero32
 
 tanh = functools.partial(cute.math.tanh, fastmath=False)

@@ -9,11 +9,14 @@ export PATH=/home/mgoin/code/vllm/.venv/bin:$PATH
 export PYTHONPATH=${SNAP:-/home/mgoin/code/vllm-muse-sd}
 export HF_HOME=/models/mgoin
 MODEL=meta-models/Muse-Spark-Open-816B-A42B-NVFP4
-PORT=${PORT:-8130}
+PORT=${PORT:-8141}
 DATA=${DATA:-/home/mgoin/muse_eval/mixed64.jsonl}
 OUTLEN=${OUTLEN:-1024}
 SPEC='{"method":"dflash","model":"RadixArk/Muse-Spark-Open-DFlash2","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}'
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+if curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then
+  echo "FATAL: something already serves on port $PORT"; exit 1
+fi
 python -c "import vllm; print('vllm from', vllm.__file__)"
 metrics() { curl -s localhost:$PORT/metrics | grep -E "^vllm:spec_decode_num_(drafts|draft_tokens|accepted_tokens)_total|^vllm:generation_tokens_total"; }
 
