@@ -219,10 +219,14 @@ def fused_qkv_projection(attn: "MuseSpark1xAttention") -> "QkvProjection | None"
 # the gate stays wider than the 32 rows that open the FP32 window).
 ROUTER_ROWS = range(8, 129)
 # The router input dtypes it serves. Both take the same exact kernel: FP32
-# activations split into three BF16 terms like the weight, so the model's FP32
-# router input (``wants_fp32_router_input``: 32 < rows <= 128) stays on the
-# fused path instead of falling back to the stock TF32 GEMM + routing kernel.
+# activations split into three BF16 terms like the weight. Isolated on B300 the
+# fused kernel beats the stock TF32 GEMM + routing chain up to 32 rows
+# (6.68/7.99/10.16 us against 8.49/12.81/23.80) and loses above it
+# (14.28/22.77 against 11.68/13.19 at 64/128), so FP32 input stops at 32 rows.
+# (The window only opens with ``torch.backends.cuda.matmul.allow_tf32`` set;
+# the default makes it dead code.)
 ROUTER_DTYPES = (torch.bfloat16, torch.float32)
+ROUTER_FP32_MAX_ROWS = 32
 
 
 def fused_router(moe: MuseSpark1xMoE) -> "MuseRouter | None":
@@ -701,7 +705,9 @@ class SpecializedDecode:
             if (
                 plan.router is not None
                 and num_tokens in ROUTER_ROWS
-                and router_input.dtype in ROUTER_DTYPES
+                and (router_input.dtype == torch.bfloat16
+                     or (router_input.dtype == torch.float32
+                         and num_tokens <= ROUTER_FP32_MAX_ROWS))
             ):
                 top_k = moe.moe_router.top_k
                 ids = router_input.new_empty(num_tokens, top_k, dtype=torch.int32)
