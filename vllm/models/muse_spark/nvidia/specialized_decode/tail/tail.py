@@ -11,11 +11,21 @@ kernel of the next boundary's all-gather::
     # the next boundary, the publisher's unchanged consumer:
     new_stream, ffn_input = publisher.gated_residual_next_rmsnorm(handle, ...)
 
-Two PDL-chained kernels: the one-shot Lamport finalize (``finalize.py``) into
-a pointer-stable ``[max_tokens, 4096]`` buffer, then the boundary package's
-publishing GEMM, which streams the unpooler shard before its grid wait and
-multicasts ``e @ unpooler_shard.T`` into the publisher's FlashInfer
-all-gather mailbox.
+Two PDL-chained kernels: a Lamport finalize into a pointer-stable
+``[max_tokens, 4096]`` buffer, then the boundary package's publishing GEMM,
+which streams the unpooler shard before its grid wait and multicasts
+``e @ unpooler_shard.T`` into the publisher's FlashInfer all-gather mailbox.
+Which finalize runs depends on the row count (``oneshot_tokens``):
+
+* up to ``PUBLISHED_TOKENS`` (16) rows the one-shot schedule of
+  ``finalize.py``: every rank multicasts its ``M * 8`` partial route rows to
+  every rank and finalizes all of them. Above 16 rows the routed experts are
+  the stock ones, so the tail publishes their rows itself;
+* above, the owner-scatter schedule of ``owned.py``: each rank pushes its
+  partial rows only to the token's owner, the owner finalizes the tokens it
+  owns and multicasts their rows, and every rank copies the rest. That is
+  ``M * 54 KB`` received per rank against ``M * 192 KB`` for the one-shot,
+  which is what makes the tail pay at 24 rows and up.
 
 With ``PublishingRoutedExperts`` (``experts.py``) the routed experts' GEMM2
 epilogue has already multicast this rank's rows into ``published_box`` at the
@@ -45,13 +55,16 @@ from ..boundary.boundary import (
 )
 from ..boundary.publishing_gemm import gmem_ptr
 from .finalize import GENERATIONS, HIDDEN, TOP_K, FinalizeKernel, compile_finalize
+from .owned import OwnedFinalize
 
-# Largest decode step the tail beats the stock chain at (B300, TP4, us/layer of
-# finalize + unpooler + all-gather publish and consume, tail vs stock: M=1 14.4
-# vs 20.1, M=4 14.5 vs 22.4, M=8 15.3 vs 24.8, M=16 19.0 vs 23.5). Its one-shot
-# publish moves three times the bytes of FlashInfer's owner-scatter finalize
-# into each rank, which loses from about 32 rows on.
-MAX_TOKENS = 16
+# Largest decode step the tail serves; the executor publishes up to
+# ``UNPOOLER_MAX_ROWS`` rows into the all-gather. Above ``PUBLISHED_TOKENS`` the
+# routed experts are the stock ones, so the tail publishes their rows itself
+# instead of starting at the poll.
+MAX_TOKENS = 128
+# Largest step whose GEMM2 rows the publishing experts multicast themselves
+# (``EXPERTS_ROWS``).
+PUBLISHED_TOKENS = 16
 CLUSTER = 8
 GRID = 128
 
@@ -213,27 +226,66 @@ class MoeTail:
         shard_columns: int = 2048,
         max_tokens: int = MAX_TOKENS,
         device=None,
+        cluster: int = CLUSTER,
+        grid: int = GRID,
+        oneshot_tokens: int = PUBLISHED_TOKENS,
     ) -> None:
         device = torch.device(device or torch.accelerator.current_device_index())
         self.group = group
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.max_tokens = max_tokens
-        shape = (GENERATIONS, self.tp, max_tokens * TOP_K, HIDDEN)
+        self.published_tokens = min(max_tokens, PUBLISHED_TOKENS)
+        # Rows the one-shot schedule takes; above, the owner-scatter one.
+        self.oneshot_tokens = min(max_tokens, max(oneshot_tokens, 1))
+        shape = (GENERATIONS, self.tp, self.oneshot_tokens * TOP_K, HIDDEN)
         self.box = LamportMailbox(group, shape, device)
         # Rows the experts publish (``PublishingRoutedExperts``), by layer
         # parity rather than by the finalize's own generations.
-        self.published_box = LamportMailbox(group, shape, device)
-        common = dict(tp=self.tp, rank=self.rank, capacity=max_tokens)
+        self.published_box = LamportMailbox(
+            group,
+            (GENERATIONS, self.tp, self.published_tokens * TOP_K, HIDDEN),
+            device,
+        )
+        common = dict(tp=self.tp, rank=self.rank, cluster=cluster, grid=grid)
         self.finalize = Finalize(
-            **common, mailbox=self.box.buffer, multicast=self.box.multicast
+            **common,
+            capacity=self.oneshot_tokens,
+            mailbox=self.box.buffer,
+            multicast=self.box.multicast,
         )
         self.published_finalize = Finalize(
             **common,
+            capacity=self.published_tokens,
             mailbox=self.published_box.buffer,
             multicast=self.published_box.multicast,
             published=True,
         )
+        # The owner-scatter schedule's two hops (``owned.py``): this rank's
+        # partial rows for the tokens its peers own, and every rank's final
+        # rows. Only built when a step can reach it.
+        self.owned: OwnedFinalize | None = None
+        self.hop1: LamportMailbox | None = None
+        self.e_box: LamportMailbox | None = None
+        if max_tokens > self.oneshot_tokens:
+            capacity_tp = -(-max_tokens // self.tp)
+            self.hop1 = LamportMailbox(
+                group, (GENERATIONS, self.tp, capacity_tp * TOP_K, HIDDEN), device
+            )
+            self.e_box = LamportMailbox(
+                group, (GENERATIONS, self.tp, max_tokens, HIDDEN), device
+            )
+            self.owned = OwnedFinalize(
+                tp=self.tp,
+                rank=self.rank,
+                capacity=max_tokens,
+                hop1=self.hop1.buffer,
+                peers=self.hop1.peers,
+                e=self.e_box.buffer,
+                multicast=self.e_box.multicast,
+                cluster=cluster,
+                grid=grid,
+            )
         self.e = torch.empty(max_tokens, HIDDEN, dtype=torch.bfloat16, device=device)
         self.publisher = publisher
         self.gemm: PublishingGemm | None = None
@@ -250,11 +302,13 @@ class MoeTail:
     def published_target(self) -> tuple[int, int, int]:
         """``(multicast address, rank, capacity)`` of the mailbox the experts
         publish their rows into."""
-        return self.published_box.multicast, self.rank, self.max_tokens
+        return self.published_box.multicast, self.rank, self.published_tokens
 
     def precompile(self, weight_dtypes=(torch.float32, torch.bfloat16)) -> None:
         self.finalize.precompile(weight_dtypes)
         self.published_finalize.precompile(weight_dtypes)
+        if self.owned is not None:
+            self.owned.precompile(weight_dtypes)
         (self.publisher or self.gemm).precompile()
 
     def reset(self) -> None:
@@ -262,6 +316,10 @@ class MoeTail:
         self.box.arm()
         self.published_box.arm()
         self.finalize.generations.zero_()
+        if self.owned is not None:
+            self.hop1.arm()
+            self.e_box.arm()
+            self.owned.generations.zero_()
         torch.accelerator.synchronize()
         dist.barrier(group=self.group)
 
@@ -284,20 +342,45 @@ class MoeTail:
         or without a publisher return it. ``parity``: the experts already
         published the rows at this layer parity (``layer_parities``), routed
         by ``topk_ids``."""
-        finalize = self.finalize if parity is None else self.published_finalize
-        if parity is not None and not unfinalized.route_major:
-            raise ValueError("published rows are route-major")
-        e = finalize(
-            unfinalized.gemm2_permuted,
-            unfinalized.expanded_idx_to_permuted_idx,
-            unfinalized.expert_weights,
-            norm_weight,
-            self.e,
-            eps=eps,
-            gain_center=gain_center,
-            parity=parity or 0,
-            topk_ids=topk_ids,
-        )
+        if parity is not None:
+            if not unfinalized.route_major:
+                raise ValueError("published rows are route-major")
+            e = self.published_finalize(
+                unfinalized.gemm2_permuted,
+                unfinalized.expanded_idx_to_permuted_idx,
+                unfinalized.expert_weights,
+                norm_weight,
+                self.e,
+                eps=eps,
+                gain_center=gain_center,
+                parity=parity,
+                topk_ids=topk_ids,
+            )
+        elif (
+            self.owned is not None
+            and unfinalized.expanded_idx_to_permuted_idx.shape[0] > self.oneshot_tokens
+        ):
+            e = self.owned(
+                unfinalized.gemm2_permuted,
+                unfinalized.expanded_idx_to_permuted_idx,
+                unfinalized.expert_weights,
+                norm_weight,
+                self.e,
+                eps=eps,
+                gain_center=gain_center,
+            )
+        else:
+            e = self.finalize(
+                unfinalized.gemm2_permuted,
+                unfinalized.expanded_idx_to_permuted_idx,
+                unfinalized.expert_weights,
+                norm_weight,
+                self.e,
+                eps=eps,
+                gain_center=gain_center,
+                parity=0,
+                topk_ids=topk_ids,
+            )
         if self.publisher is not None:
             return self.publisher(e, unpooler_shard)
         assert self.gemm is not None
