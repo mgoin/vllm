@@ -213,14 +213,19 @@ def fused_qkv_projection(attn: "MuseSpark1xAttention") -> "QkvProjection | None"
     return projection.prepare(range(1, QKV_FUSED_MAX_ROWS + 1), kv_out=False)
 
 
-# Rows of BF16 router input the fused router serves (faster than the stock
-# router GEMM and routing kernel there, on B300).
+# Rows of router input the fused router serves (faster than the stock router
+# GEMM and routing kernel there, on B300).
 ROUTER_ROWS = range(8, 129)
+# The router input dtypes it serves. Both take the same exact kernel: FP32
+# activations split into three BF16 terms like the weight, so the model's FP32
+# router input (``wants_fp32_router_input``: 32 < rows <= 128) stays on the
+# fused path instead of falling back to the stock TF32 GEMM + routing kernel.
+ROUTER_DTYPES = (torch.bfloat16, torch.float32)
 
 
 def fused_router(moe: MuseSpark1xMoE) -> "MuseRouter | None":
     """The fused router of an NVFP4 MoE layer whose routing runs ahead of the
-    experts, compiled for BF16 input."""
+    experts, compiled for BF16 and FP32 input."""
     from ..moe.router import MuseRouter
 
     if not (
@@ -236,7 +241,7 @@ def fused_router(moe: MuseSpark1xMoE) -> "MuseRouter | None":
         top_k=router.top_k,
         route_scale=router.route_scale,
         eps=router.router_score_division_eps,
-    ).prepare(ROUTER_ROWS, dtypes=(torch.bfloat16,))
+    ).prepare(ROUTER_ROWS, dtypes=ROUTER_DTYPES)
 
 
 # Rows of the persistent routed experts, which run one 8-column tile kernel for
@@ -694,7 +699,7 @@ class SpecializedDecode:
             if (
                 plan.router is not None
                 and num_tokens in ROUTER_ROWS
-                and router_input.dtype == torch.bfloat16
+                and router_input.dtype in ROUTER_DTYPES
             ):
                 top_k = moe.moe_router.top_k
                 ids = router_input.new_empty(num_tokens, top_k, dtype=torch.int32)

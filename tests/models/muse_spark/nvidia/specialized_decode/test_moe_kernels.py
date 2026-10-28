@@ -40,11 +40,22 @@ def router():
     return MuseRouter(weight, bias)
 
 
-def stock(router, x):
-    """GateLinear's FP32-weight dispatch on Blackwell, then the Triton router."""
+def stock(router, x, tf32=False):
+    """GateLinear's FP32-weight dispatch on Blackwell, then the Triton router.
+
+    Past the stock exact kernel's 32-token limit an FP32 input reaches
+    ``F.linear``, so ``tf32`` is the deployment's TF32 GEMM there
+    (``VLLM_FLOAT32_MATMUL_PRECISION`` is what makes the model ask for the FP32
+    input in the first place).
+    """
     import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401
 
-    logits = torch.ops.vllm.fp32_router_gemm_dispatch(x, router.weight, True)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = tf32
+    try:
+        logits = torch.ops.vllm.fp32_router_gemm_dispatch(x, router.weight, True)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
     weights, ids = fused_musespark1x_routing(
         logits, router.expert_bias, TOP_K, 1.0, router_score_division_eps=EPS
     )
@@ -92,6 +103,64 @@ def test_matches_stock(router, m, dtype):
     torch.testing.assert_close(
         weights[clear], stock_weights[clear], atol=1e-5, rtol=1e-4
     )
+
+
+@pytest.mark.parametrize("m", [33, 40, 64, 96, 128])
+def test_fp32_router_input(router, m):
+    """The deployment's FP32 router input (32 < rows <= 128, the window where
+    ``wants_fp32_router_input`` asks for one): the fused kernel takes it and
+    stays exact, where the stock chain lands on a TF32 GEMM past 32 rows."""
+    x = activations(m, torch.float32, m)
+    logits, ids, weights = run(router, x)
+    exact = x.double() @ router.weight.double().t()
+    error = (logits.double() - exact).abs().max() / exact.abs().max()
+    assert error < LOGIT_RTOL[torch.float32]
+
+    # The selection, bit for bit, from the same logits.
+    ref_weights, ref_ids = fused_musespark1x_routing(
+        logits.clone(), router.expert_bias, TOP_K, 1.0, router_score_division_eps=EPS
+    )
+    torch.testing.assert_close(ids, ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(weights, ref_weights, atol=0, rtol=0)
+
+    # The FP64 reference's own top-8: by biased score, ties to the lower expert.
+    scores = torch.sigmoid(exact) + router.expert_bias.double()
+    top = scores.topk(TOP_K + 1, dim=-1).values
+    clear = (top[:, TOP_K - 1] - top[:, TOP_K]) > TIE_GAP
+    expected = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    expected = expected[:, :TOP_K].to(torch.int32)
+    assert clear.float().mean() > 0.5
+    torch.testing.assert_close(ids[clear], expected[clear], atol=0, rtol=0)
+
+    # The stock chain on the same input, as the deployment runs it (TF32 past
+    # the stock exact kernel's 32-token limit): ~1500x coarser logits, and it
+    # flips experts exactly where the fused kernel still gets the reference
+    # order right, i.e. at 8th/9th biased-score gaps up to ~3e-3.
+    tf32_logits, tf32_ids, tf32_weights = stock(router, x, tf32=True)
+    tf32_error = (tf32_logits.double() - exact).abs().max() / exact.abs().max()
+    assert tf32_error > 100 * error
+    flipped = (tf32_ids != ids).any(-1)
+    print(
+        f"m={m}: exact {error:.2e}, tf32 {tf32_error:.2e}, "
+        f"{clear.float().mean():.0%} clear rows, tf32 flips "
+        f"{flipped.float().mean():.1%} of them"
+    )
+    assert flipped[clear].float().mean() < 0.1
+    torch.testing.assert_close(
+        weights[clear][~flipped[clear]],
+        tf32_weights[clear][~flipped[clear]],
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_fused_router_serves_fp32_input():
+    """The executor's gate takes the fused path for both router input dtypes,
+    the FP32 one included (it used to fall back to the stock chain)."""
+    from vllm.models.muse_spark.nvidia.specialized_decode.runtime import decode
+
+    assert decode.ROUTER_DTYPES == (torch.bfloat16, torch.float32)
+    assert 33 in decode.ROUTER_ROWS and 128 in decode.ROUTER_ROWS
 
 
 def test_deterministic(router):
