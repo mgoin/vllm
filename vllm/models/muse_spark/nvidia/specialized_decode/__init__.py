@@ -31,13 +31,17 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
-# Rows of the largest step the executor runs: 8 requests verifying 8 tokens
-# each. Above it the stock layers are at least as fast today: at 128 rows the
-# executor's own fused stages (all-reduce + dual norm, router, qkv) cost more
-# than the stock kernels they replace, and the end-to-end step is 2.3-2.8 %
-# slower (measured at concurrency 16, with and without adaptive verification).
-# Raise it only with a measurement that beats stock at 128 rows.
-MAX_ROWS = 64
+# Rows of the largest step the executor runs: 16 requests verifying 8 tokens
+# each. A stage-off A/B in the harness puts every executor stage ahead of the
+# stock kernels at 128 rows too (11.8 us/layer better over the whole forward);
+# the end-to-end difference at concurrency 16 is inside this box's 3 %
+# run-to-run spread, so the executor keeps the throughput case.
+MAX_ROWS = 128
+# Rows whose routed experts the persistent kernel serves, and therefore the
+# largest step whose GEMM2 rows the publishing experts hand to the MoE tail.
+# The tail's published mailbox is sized by it, so it is one constant.
+MAX_EXPERT_ROWS = 64
+
 # The flashinfer-python that requirements/cuda.txt pins. The executor calls
 # FlashInfer's mnnvl_cutedsl internals and reads its attention metadata.
 FLASHINFER_VERSION = "0.7.2.post1"

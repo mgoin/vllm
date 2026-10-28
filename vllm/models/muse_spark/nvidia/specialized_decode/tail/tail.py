@@ -17,10 +17,10 @@ which streams the unpooler shard before its grid wait and multicasts
 ``e @ unpooler_shard.T`` into the publisher's FlashInfer all-gather mailbox.
 Which finalize runs depends on the row count (``oneshot_tokens``):
 
-* up to ``PUBLISHED_TOKENS`` (16) rows the one-shot schedule of
+* up to ``ONESHOT_TOKENS`` (16) rows the one-shot schedule of
   ``finalize.py``: every rank multicasts its ``M * 8`` partial route rows to
-  every rank and finalizes all of them. Above 16 rows the routed experts are
-  the stock ones, so the tail publishes their rows itself;
+  every rank and finalizes all of them. The publishing experts have usually
+  multicast those rows already (``parity``), so it starts at the poll;
 * above, the owner-scatter schedule of ``owned.py``: each rank pushes its
   partial rows only to the token's owner, the owner finalizes the tokens it
   owns and multicasts their rows, and every rank copies the rest. That is
@@ -53,18 +53,22 @@ from ..boundary.boundary import (
     Published,
     PublishingGemm,
 )
+from .. import MAX_EXPERT_ROWS
 from ..boundary.publishing_gemm import gmem_ptr
 from .finalize import GENERATIONS, HIDDEN, TOP_K, FinalizeKernel, compile_finalize
 from .owned import OwnedFinalize
 
-# Largest decode step the tail serves; the executor publishes up to
-# ``UNPOOLER_MAX_ROWS`` rows into the all-gather. Above ``PUBLISHED_TOKENS`` the
-# routed experts are the stock ones, so the tail publishes their rows itself
-# instead of starting at the poll.
-MAX_TOKENS = 128
-# Largest step whose GEMM2 rows the publishing experts multicast themselves
-# (``EXPERTS_ROWS``).
-PUBLISHED_TOKENS = 16
+# Largest step whose GEMM2 rows the publishing experts hand over themselves.
+# It is ``EXPERTS_ROWS.stop - 1``: the published mailbox below is sized by it,
+# and a mismatch would overwrite a peer's rows rather than fail.
+PUBLISHED_TOKENS = MAX_EXPERT_ROWS
+# Largest decode step the tail serves: the rows whose GEMM2 rows the routed
+# experts can hand it. Larger steps run the stock finalize and unpooler.
+MAX_TOKENS = PUBLISHED_TOKENS
+# Largest step the one-shot schedule takes; above, the owner-scatter one (see
+# ``owned.py`` and the module docstring). Measured, not a capacity: the
+# one-shot's ``M * 192 KB`` per rank ingress loses from 24 rows on.
+ONESHOT_TOKENS = 16
 CLUSTER = 8
 GRID = 128
 
@@ -228,7 +232,7 @@ class MoeTail:
         device=None,
         cluster: int = CLUSTER,
         grid: int = GRID,
-        oneshot_tokens: int = PUBLISHED_TOKENS,
+        oneshot_tokens: int = ONESHOT_TOKENS,
     ) -> None:
         device = torch.device(device or torch.accelerator.current_device_index())
         self.group = group
@@ -342,7 +346,8 @@ class MoeTail:
         or without a publisher return it. ``parity``: the experts already
         published the rows at this layer parity (``layer_parities``), routed
         by ``topk_ids``."""
-        if parity is not None:
+        m = unfinalized.expanded_idx_to_permuted_idx.shape[0]
+        if parity is not None and m <= self.oneshot_tokens:
             if not unfinalized.route_major:
                 raise ValueError("published rows are route-major")
             e = self.published_finalize(
@@ -356,10 +361,7 @@ class MoeTail:
                 parity=parity,
                 topk_ids=topk_ids,
             )
-        elif (
-            self.owned is not None
-            and unfinalized.expanded_idx_to_permuted_idx.shape[0] > self.oneshot_tokens
-        ):
+        elif self.owned is not None and m > self.oneshot_tokens:
             e = self.owned(
                 unfinalized.gemm2_permuted,
                 unfinalized.expanded_idx_to_permuted_idx,

@@ -55,9 +55,11 @@ class PublishingExpertsKernel(device.RoutedExpertsKernel):
         self._out = None
 
     def epilogue(self, *args):
-        # The GEMM2 rows' destination, for the row store's offsets.
+        # The GEMM2 rows' destination, for the row store's offsets. Only this
+        # method's stores publish: the GEMM1 SwiGLU output shares `store_v2`.
         self._out = args[16].iterator
-        return device.RoutedExpertsKernel.epilogue(self, *args)
+        with _publishing_rows(self):
+            return device.RoutedExpertsKernel.epilogue(self, *args)
 
     def store_row(self, store, address, a, b, *, loc=None, ip=None):
         store(address, a, b, loc=loc, ip=ip)
@@ -84,7 +86,7 @@ def _kernel(device_index: int, slot_base: int):
     """``PublishingExpertsKernel`` compiled for a device and a mailbox slot."""
     kernel = PublishingExpertsKernel(host.STAGES, slot_base)
     fake = host._fake
-    with torch.accelerator.device_index(device_index), _publishing_rows(kernel):
+    with torch.accelerator.device_index(device_index):
         return cute.compile(
             kernel,
             fake(cutlass.Float4E2M1FN, 32),

@@ -107,10 +107,43 @@ boundary/attention code: at 8 rows 48 % is the expert stream and the remaining ~
 ten stages that are each within ~1.3x of their own roofline. The remaining c=1 levers are the expert
 kernel's stream rate, the router's 8.7 us, and the cross-rank wait inside the o_proj boundary.
 
+**Expert stream, measured with ncu (experts agent):** one expert is 7.08 MB — 6.29 MB of E2M1
+weights *plus 0.79 MB of E4M3 block scales* — so every roofline that used 6.29 MB understated the
+stream by 12 %. At 128 rows ncu counts 1.79 GB read against 1 798 MB computed from the routing: the
+reads are exactly once, no per-N-tile re-read, and the only duplication is the 1 % of experts that
+hold more than 8 tokens. The kernel moves that at 6.12 TB/s (6.45 under ncu-locked clocks) against
+stock's 6.79 TB/s for the same bytes; the residual 11 % is in-flight depth (128 KB per CTA with 8
+stages versus stock's 160 KB), proven by the stage sweep 3/4/8 = 5.33/5.70/5.93 TB/s, and request
+granularity is *not* the cause (CTA_K=512 is bit-exactly equal at equal in-flight bytes).
+
 **Bandwidth calibration (experts agent, nsys + ncu):** a pure streaming read on this box runs at
 5.5-5.8 TB/s (80 % of a 7.66 TB/s peak), and the stock TRT-LLM expert GEMMs reach 5.99 TB/s at 128
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
 target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
+
+## Measurement noise (important)
+
+Two server launches of the *same* configuration differ by up to 3 % on step time at
+concurrency 8-16 here, and acceptance length swings by up to 10 % (c=2: AL 4.54 vs 4.11
+for stock vs executor on the same prompts). Everything at the 1-3 % level needs repeat
+runs. In particular the c=16 "regression" I chased (2.3 % with adaptive verification
+off, 2.8 % on) is inside that band, and the stage-off A/B (below) says the executor is
+*not* losing at 128 rows in the harness: 3773 us per 8-layer forward against stock's
+3868, i.e. 11.8 us/layer better.
+
+## Integration state (experts kernel merged, fused tail parked, MAX_ROWS=64)
+
+Per-layer forward, dummy weights, TP4, no EP, executor vs the stock numbers measured the same way:
+
+| rows | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock us | 155.6 | 204.8 | 276.4 | 340.7 | 397.0 | 461.7 |
+| executor, old expert kernel + tail | 116.7 | 162.3 | 239.2 | 317.9 | 385.2 | 463.3 |
+| executor, new expert kernel, tail parked | 127.5 | 171.0 | 233.7 | 314.4 | stock (above MAX_ROWS) | stock |
+
+The new expert kernel is a win at every row count it serves and improves 32/64 rows over the old one
+(239 -> 234, 318 -> 314). Parking the fused tail costs 11 us/layer at 8 rows, which is the size of the
+prize for rebinding it. 128 rows and above run stock: parity by construction.
 
 ## Executor kernel profile (8 rows and 128 rows, 8-layer truncated model, TP4, no EP)
 
