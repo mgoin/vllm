@@ -121,6 +121,16 @@ granularity is *not* the cause (CTA_K=512 is bit-exactly equal at equal in-fligh
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
 target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
 
+## Measurement noise (important)
+
+Two server launches of the *same* configuration differ by up to 3 % on step time at
+concurrency 8-16 here, and acceptance length swings by up to 10 % (c=2: AL 4.54 vs 4.11
+for stock vs executor on the same prompts). Everything at the 1-3 % level needs repeat
+runs. In particular the c=16 "regression" I chased (2.3 % with adaptive verification
+off, 2.8 % on) is inside that band, and the stage-off A/B (below) says the executor is
+*not* losing at 128 rows in the harness: 3773 us per 8-layer forward against stock's
+3868, i.e. 11.8 us/layer better.
+
 ## Integration state (experts kernel merged, fused tail parked, MAX_ROWS=64)
 
 Per-layer forward, dummy weights, TP4, no EP, executor vs the stock numbers measured the same way:

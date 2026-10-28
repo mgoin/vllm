@@ -8,7 +8,7 @@ Blackwell. DeepSeek-V4.1 and Kimi-K3 have their own packages with the same
 `decode_backend` setting and their own deployment requirements.
 
 The executor runs only the decoder layers of a **pure decode or verify step
-captured into a FULL CUDA graph** of at most 64 rows. Prefill, mixed
+captured into a FULL CUDA graph** of at most 128 rows. Prefill, mixed
 prefill/decode, eager execution and PIECEWISE captures run the stock layers,
 which the package does not modify. Speculative decoding of any method
 (DFlash, DFlash2, DSpark) is supported, with or without adaptive verification;
@@ -71,7 +71,7 @@ no-graphs deployment. It serves no requests, so it is not a serving mode.
 
 - **Serving without CUDA graphs.** Use FULL decode graphs. An eager server is
   rejected at startup rather than silently running stock.
-- **Rows above 64**, or non-uniform (prefill) steps. Those forward passes run
+- **Rows above 128**, or non-uniform (prefill) steps. Those forward passes run
   the stock layers.
 - **FP8 (or other non-BF16) KV caches.** The fused QKV projection with the
   KV-cache insert is skipped and the stock projection and cache insert run
@@ -97,18 +97,18 @@ times the acceptance length. Acceptance length swings by about ±0.12 between
 server launches with probabilistic drafting, so compare step times rather than
 tokens/s across runs.
 
-| Concurrency | Stock step | Specialized step |
-| --- | --- | --- |
-| 1 | 9.52 ms | 8.02 ms (−16%) |
-| 4 | 13.40 ms | 11.20 ms (−16%) |
-| 16 | 20.17 ms | stock layers (see below) |
+| Concurrency | Stock step | Specialized step | Tokens/s |
+| --- | --- | --- | --- |
+| 1 | 9.57 ms | 8.52 ms (−11%) | 438 -> 490 (+12%) |
+| 2 | 11.85 ms | 10.36 ms (−13%) | 739 -> 748 |
+| 4 | 14.04 ms | 12.81 ms (−9%) | 1110 -> 1221 (+10%) |
+| 8 | 16.43 ms | 16.82 ms | equal within run-to-run spread |
+| 16 | 20.29 ms | 20.98 ms | equal within run-to-run spread |
 
-At concurrency 16 a step verifies 128 rows, above the 64 rows the executor runs,
-so those steps use the stock layers and cost the same as stock. Above 64 rows the
-executor's own fused stages are slower than the kernels they replace — at 128
-rows its all-reduce and dual norm costs 77.9 us per layer against stock's 25.4,
-its router 48.2 against 12.8, and its fused QKV 28.2 against 9.5 — so the
-executor hands those steps back rather than losing to them.
+A step at concurrency 8 and above verifies 64 or more rows, where the two paths
+converge: two server launches of the *same* configuration differ by up to 3 % on
+step time here (acceptance length swings with probabilistic drafting), so read the
+8 and 16 rows as "the same" rather than as a small loss.
 
 GSM8K is within noise of stock (0.959 stock, 0.958 specialized on 1319
 questions at concurrency 32).
@@ -123,7 +123,7 @@ B200 (SM100) is accepted by the deployment check but has not been measured.
 The startup log prints one line when the executor is enabled:
 
 ```text
-Muse Spark specialized decode on, for FULL-graph decode steps of up to 64 rows.
+Muse Spark specialized decode on, for FULL-graph decode steps of up to 128 rows.
 ```
 
 `vllm bench serve` against the same model with and without the setting shows

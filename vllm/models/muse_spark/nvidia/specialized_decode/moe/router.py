@@ -55,7 +55,6 @@ WARPS = THREADS // 32
 WARP_K = CHUNK // WARPS  # K elements per warp
 STEPS = WARP_K // 16  # K16 MMA steps per warp
 TILE = 8  # MMA N: activation rows per tile
-GATED_PASS_ROWS = 64  # above this, stage 32 BF16 rows a pass instead of 16
 MAX_ROWS = 256
 GROUPS = EXPERTS // GROUP
 SENTINEL = -1  # an FP32 NaN no arithmetic produces: an empty mailbox word
@@ -454,15 +453,10 @@ def mailboxes(device: torch.device) -> torch.Tensor:
     return empty.to(device).view(torch.float32)
 
 
-def tiles_per_pass(rows: int, fp32: bool = False) -> int:
-    """MMA tiles per staging pass: the shared staging buffer holds 32 BF16 rows
-    (or 16 FP32 ones), and past ``GATED_PASS_ROWS`` a wider pass halves the
-    number of barrier-and-staging round trips."""
+def tiles_per_pass(rows: int) -> int:
     if not 0 < rows <= MAX_ROWS:
         raise ValueError(f"MuseRouter serves 1..{MAX_ROWS} rows, got {rows}")
-    if rows <= TILE:
-        return 1
-    return 2 if fp32 or rows <= GATED_PASS_ROWS else 4
+    return 1 if rows <= TILE else 2
 
 
 class MuseRouter:
@@ -499,7 +493,7 @@ class MuseRouter:
 
     def kernel(self, rows: int, dtype: torch.dtype, keep_logits: bool = False):
         fp32 = dtype == torch.float32
-        tiles = tiles_per_pass(rows, fp32)
+        tiles = tiles_per_pass(rows)
         return compile_router(tiles, fp32, keep_logits, self.device.index)
 
     def prepare(self, rows, dtypes=(torch.bfloat16, torch.float32)) -> "MuseRouter":
