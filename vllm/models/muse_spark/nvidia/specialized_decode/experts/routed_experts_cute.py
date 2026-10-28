@@ -36,7 +36,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """Muse Spark NVFP4 routed experts (GEMM1, SwiGLU, GEMM2) in one persistent
-CuTe DSL kernel for decode batches of 1-64 tokens at TP4.
+CuTe DSL kernel for decode and verify batches of 1-128 tokens at TP4.
 
 Per rank: 256 experts, ``w13`` [2048, 4096] and ``w2`` [4096, 1024] NVFP4
 (E2M1 with an E4M3 scale per 16 elements and FP32 per-expert global scales),
@@ -48,40 +48,46 @@ rows of FlashInfer's ``trtllm_fp4_block_scale_routed_moe`` with
 ``8 t + k`` holds route (token ``t``, slot ``k``).
 
 Work: every CTA builds the call's routing table from ``topk_ids`` in shared
-memory (the touched experts in ascending id order as *slots*, each slot's
-tokens in ascending order). The work items are, for every slot, 16 GEMM1 items
-(128 ``w13`` rows = 64 intermediate columns, K = 4096) then, after all GEMM1
-items, 32 GEMM2 items (128 hidden rows, K = 1024); CTAs take them from a global
-counter, so the GEMM2 weights of the experts whose intermediate is done stream
-while the last GEMM1 items finish. An item multiplies its 128 weight rows by
-``N`` activation rows (N = the call's token count rounded up to 8, 16, 32 or
-64): GEMM1 by every token (the epilogue keeps the slot's tokens), GEMM2 by the
-slot's intermediate rows. The MMAs are ``tcgen05`` ``kind::mxf4nvf4`` 128 x N x
-64 in ascending K, without split-K, the order of the TRT-LLM-gen kernels.
+memory (the touched experts in ascending id order), then every CTA gathers
+each expert's token rows and block scales into a *compact* activation array,
+one 8-row chunk per 8 tokens of an expert, and a grid-wide barrier releases
+the GEMMs. Compacting is what keeps the MMA, the activation loads and the
+epilogue proportional to the routing instead of to the batch: at 64 tokens an
+expert holds ~2.3 of them, so an uncompacted 64-column tile would compute and
+re-read 28x what it stores.
+
+The work items are, for every chunk, 16 GEMM1 items (128 ``w13`` rows = 64
+intermediate columns, K = 4096) then, after all GEMM1 items, 32 GEMM2 items
+(128 hidden rows, K = 1024); CTAs take them from a global counter, so the
+GEMM2 weights of the experts whose intermediate is done stream while the last
+GEMM1 items finish. An item multiplies its 128 weight rows by the chunk's 8
+activation rows: GEMM1 by the chunk's tokens, GEMM2 by the chunk's
+intermediate rows. The MMAs are ``tcgen05`` ``kind::mxf4nvf4`` 128 x 8 x 64 in
+ascending K, without split-K, the shape and order of the TRT-LLM-gen kernels.
 
 GEMM1's epilogue applies SwiGLU with the per-expert gate and up scales and
 quantizes the intermediate H to NVFP4 (E4M3 block scales of amax / 6), with
 the instruction sequence of the TRT-LLM-gen epilogue, writes H and its scales
-to a workspace and releases the slot's counter; the slot's GEMM2 items load H
-(TMA) once the counter reaches 16. GEMM2's epilogue scales by the per-expert
+to a workspace and releases the chunk's counter; the chunk's GEMM2 items load
+H (TMA) once the counter reaches 16. GEMM2's epilogue scales by the per-expert
 output scale and stores BF16 rows.
 
 Warps: 0 schedules the items and loads A (weights) with evict-first hints, 1
-loads B (activations, H) and B's scales, 2 issues the MMAs, 4-7 run the
-epilogue; at the start every warp builds the routing table and warps 3-7 stage
-the input scales. Programmatic dependent launch: every CTA reads the routing
-only after its grid dependency wait. Reading it earlier is unsafe even when
-the router runs on another stream: inside a CUDA graph capture the edge from
-an event-joined node also becomes programmatic, and without the aux stream the
-router is the kernel right before this one. CTAs that read different ids
-would build different tables and wait forever for each other's work.
+loads B (the chunk's activations, H) and B's scales, 2 issues the MMAs, 4-7
+run the epilogue; at the start every warp builds the routing table, gathers
+and zeroes. Programmatic dependent launch: every CTA reads the routing only
+after its grid dependency wait. Reading it earlier is unsafe even when the
+router runs on another stream: inside a CUDA graph capture the edge from an
+event-joined node also becomes programmatic, and without the aux stream the
+router is the kernel right before this one. CTAs that read different ids would
+build different tables and wait forever for each other's work.
 
 Degenerate routing is tolerated: an id outside [0, 256) is a no-op route whose
 row is zero; an expert repeated within a token's top-8 gets one H row, and
 each of its routes the same GEMM2 row.
 
-The last CTA to finish resets the work counter and the slot counters in the
-workspace, so consecutive calls need no memset.
+The last CTA to finish resets the work counter, the gather counter and the
+chunk counters in the workspace, so consecutive calls need no memset.
 """
 
 from __future__ import annotations
@@ -94,7 +100,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass import Float32, Int32, Int64, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
@@ -103,25 +109,38 @@ HIDDEN = 4096
 INTER = 1024
 EXPERTS = 256
 TOP_K = 8
-MAX_ROWS = 64
+# Tokens (activation rows) of one call: the routing mask of an expert is four
+# 32-token words.
+MAX_ROWS = 128
 CTA_M = 128
 CTA_K = 256
 SF_VEC = 16
+# Activation columns of one MMA: the compact row chunk of one expert's tokens.
+N_COLS = 8
 G1_M_TILES = 2 * INTER // CTA_M  # 16: 64 intermediate columns each
 G2_M_TILES = HIDDEN // CTA_M  # 32
 G1_K_TILES = HIDDEN // CTA_K  # 16
 G2_K_TILES = INTER // CTA_K  # 4
 G1_ITEMS = G1_M_TILES
-SLOT_ITEMS = G1_M_TILES + G2_M_TILES
-# H block scales of one slot: one 128x4 atom (512 B) per 64 intermediate columns.
-HS_SLOT_BYTES = INTER // 64 * 512
+CHUNK_ITEMS = G1_M_TILES + G2_M_TILES
+# Compact row chunks: ceil(count / N_COLS) per touched expert, at most
+# routes / N_COLS + 7 * EXPERTS / 8.
+MAX_CHUNKS = 384
+MAX_CROWS = MAX_CHUNKS * N_COLS
+# H block scales of one chunk: one 128x4 atom (512 B) per 64 intermediate
+# columns.
+HS_CHUNK_BYTES = INTER // 64 * 512
 STAGE_SFB_BYTES = CTA_K // 64 * 512
+# Input block scales of one chunk, in the same per-K-tile atoms.
+XS_CHUNK_BYTES = G1_K_TILES * STAGE_SFB_BYTES
 RING = 8
-# Workspace words: work counter, finished CTAs, then one counter per slot.
+# Workspace words: work counter, finished CTAs, gathered CTAs, then one
+# intermediate counter per chunk.
 WS_QUEUE = 0
 WS_DONE = 1
-WS_FLAGS = 2
-WS_WORDS = WS_FLAGS + EXPERTS
+WS_GATHER = 2
+WS_FLAGS = 3
+WS_WORDS = WS_FLAGS + MAX_CHUNKS
 EVICT_FIRST = 0x12F0000000000000
 THREADS = 256
 EPI_WARP = 4
@@ -344,6 +363,22 @@ def store_zero_v2(address):
     return "st.global.v2.b32 [$0], {$1, $1};", "l,r,~{memory}", (address, Uint32(0))
 
 
+@asm((Uint32, Uint32))
+def load_v2(address):
+    """Two words of a 16-byte-aligned global address."""
+    return "ld.global.v2.b32 {$0, $1}, [$2];", "=r,=r,l,~{memory}", (address,)
+
+
+@asm(Uint32)
+def load_u32(address):
+    return "ld.global.b32 $0, [$1];", "=r,l,~{memory}", (address,)
+
+
+@asm()
+def store_u32(address, value):
+    return "st.global.b32 [$0], $1;", "l,r,~{memory}", (address, Uint32(value))
+
+
 @asm()
 def trap():
     return "trap;", "~{memory}", ()
@@ -406,38 +441,35 @@ def prefetch_l2(base, offset, size):
     return code, "l,l,r", (base, Int64(offset), Int32(size))
 
 
-@asm()
-def store_shared_u32(address, value):
-    return "st.shared.b32 [$0], $1;", "r,r,~{memory}", (address, Uint32(value))
-
-
 @cute.jit
-def tile_rank(mask: Uint64, token: Int32) -> Int32:
-    """Tokens of ``mask`` below ``token``."""
-    below = (Uint64(1) << Uint64(token)) - Uint64(1)
-    return Int32(cute.arch.popc(mask & below))
+def chunk_rank(masks: cute.Tensor, expert: Int32, token: Int32) -> Int32:
+    """Tokens of ``expert``'s routing mask below ``token``."""
+    block = token // 32
+    below = (Uint32(1) << Uint32(token % 32)) - Uint32(1)
+    rank = Int32(0)
+    for w in cutlass.range_constexpr(4):
+        if w < block:
+            rank += Int32(cute.arch.popc(masks[expert * 4 + w]))
+        elif w == block:
+            rank += Int32(cute.arch.popc(masks[expert * 4 + w] & below))
+    return rank
 
 
 class RoutedExpertsKernel:
-    """The persistent kernel (module docstring) for N-column activation tiles
-    (``n`` in 8, 16, 32, 64: calls of up to ``n`` tokens)."""
+    """The persistent kernel (module docstring) over 8-column activation tiles:
+    every call gathers its routing into compact row chunks (``N_COLS`` tokens
+    of one expert each) and runs the same kernel for any token count up to
+    ``MAX_ROWS``."""
 
-    def __init__(self, n: int, ids_ready: bool, num_stages: int) -> None:
-        assert n in (8, 16, 32, 64)
-        self.cta_n = n
-        # Accepted for compatibility; the routing is always read after the
-        # grid dependency wait (module docstring).
-        self.ids_ready = ids_ready
-        # Debug: trap after this many polls of a slot counter (0: never).
+    def __init__(self, num_stages: int) -> None:
+        # Debug: trap after this many polls of a chunk counter (0: never).
         self.spin_limit = int(os.environ.get("VLLM_MUSE_EXPERTS_SPIN_LIMIT", "0"))
         self.num_stages = num_stages
         self.acc_dtype = Float32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.num_acc_stage = 2
-        self.tmem_cols = 32
-        while self.tmem_cols < 2 * n + 32:
-            self.tmem_cols *= 2
+        self.cta_n = N_COLS
 
     def _tiled_mma(self, mn: tuple) -> cute.TiledMma:
         return sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -452,16 +484,21 @@ class RoutedExpertsKernel:
         )
 
     def _setup_attributes(self) -> None:
-        tiled_mma = self._tiled_mma((CTA_M, self.cta_n))
+        tiled_mma = self._tiled_mma((CTA_M, N_COLS))
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         self.mma_inst_tile_k = CTA_K // mma_inst_shape_k
-        self.num_acc_tmem_cols = self.cta_n * self.num_acc_stage
+        self.num_acc_tmem_cols = N_COLS * self.num_acc_stage
         self.num_sfa_tmem_cols = (CTA_M // 32) * self.mma_inst_tile_k
+        # Accumulator and both scale operands, rounded to a power of two.
+        cols = self.num_acc_tmem_cols + 2 * self.num_sfa_tmem_cols
+        self.tmem_cols = 32
+        while self.tmem_cols < cols:
+            self.tmem_cols *= 2
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
         )
-        tile_mnk = (CTA_M, self.cta_n, CTA_K)
+        tile_mnk = (CTA_M, N_COLS, CTA_K)
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma, tile_mnk, self.a_dtype, self.num_stages
         )
@@ -477,10 +514,6 @@ class RoutedExpertsKernel:
         self.sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
             self.tiled_mma_sfb, self.mma_tiler_sfb, SF_VEC, self.num_stages
         )
-        # The input's scales for every K tile of GEMM1, resident.
-        self.sfx_smem_layout = blockscaled_utils.make_smem_layout_sfb(
-            self.tiled_mma_sfb, self.mma_tiler_sfb, SF_VEC, G1_K_TILES
-        )
 
     @cute.jit
     def __call__(
@@ -495,8 +528,9 @@ class RoutedExpertsKernel:
         g1a_ptr: cute.Pointer,
         g1c_ptr: cute.Pointer,
         g2a_ptr: cute.Pointer,
+        xc_ptr: cute.Pointer,
+        xcs_ptr: cute.Pointer,
         h_ptr: cute.Pointer,
-        hb_ptr: cute.Pointer,
         hs_ptr: cute.Pointer,
         ws_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
@@ -507,17 +541,18 @@ class RoutedExpertsKernel:
         """``w13`` [E, 2048, 4096] / ``w2`` [E, 4096, 1024] E2M1 with E4M3
         scales in the 128x4 layout; ``x`` [rows, 4096] E2M1 with linear E4M3
         scales (``xs`` as Uint32 words); ``ids`` int32 [rows, 8]; FP32 [E]
-        gate, up and output scales; H [E * N, 1024] E2M1 (``h`` and ``hb``
-        the same buffer), HS [E, 8192] bytes; ``ws`` the int32 workspace;
-        ``out`` [rows * 8, 4096] BF16 as Uint32 words."""
+        gate, up and output scales; ``xc``/``xcs`` the compact activation rows
+        and their scales; H (``h`` and ``hb`` the same buffer) and HS
+        [chunk, 8192] bytes; ``ws`` the int32 workspace; ``out`` [rows * 8,
+        4096] BF16 as Uint32 words."""
         self.a_dtype = w13_ptr.value_type
         self.b_dtype = x_ptr.value_type
         self.sf_dtype = w13s_ptr.value_type
         self.a_major_mode = tcgen05.OperandMajorMode.K
         self.b_major_mode = tcgen05.OperandMajorMode.K
         self._setup_attributes()
-        tiled_mma = self._tiled_mma((CTA_M, self.cta_n))
-        tile_mnk = (CTA_M, self.cta_n, CTA_K)
+        tiled_mma = self._tiled_mma((CTA_M, N_COLS))
+        tile_mnk = (CTA_M, N_COLS, CTA_K)
 
         w13 = cute.make_tensor(
             w13_ptr,
@@ -536,9 +571,13 @@ class RoutedExpertsKernel:
         x = cute.make_tensor(
             x_ptr, cute.make_ordered_layout((rows, HIDDEN, 1), order=(1, 0, 2))
         )
+        xc = cute.make_tensor(
+            xc_ptr,
+            cute.make_ordered_layout((MAX_CROWS, HIDDEN, 1), order=(1, 0, 2)),
+        )
         h = cute.make_tensor(
             h_ptr,
-            cute.make_ordered_layout((EXPERTS * self.cta_n, INTER, 1), order=(1, 0, 2)),
+            cute.make_ordered_layout((MAX_CROWS, INTER, 1), order=(1, 0, 2)),
         )
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma.thr_id
@@ -577,7 +616,7 @@ class RoutedExpertsKernel:
             internal_type=cutlass.Int16,
         )
         tma_b1, tma_tensor_b1 = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, x, b_smem_layout, tile_mnk, tiled_mma, shape
+            b_op, xc, b_smem_layout, tile_mnk, tiled_mma, shape
         )
         tma_b2, tma_tensor_b2 = cute.nvgpu.make_tiled_tma_atom_B(
             b_op, h, b_smem_layout, tile_mnk, tiled_mma, shape
@@ -587,15 +626,33 @@ class RoutedExpertsKernel:
         ) + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         self.tma_bytes_b = cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
-        xs = cute.make_tensor(xs_ptr, cute.make_layout(rows * (HIDDEN // 64)))
         ids = cute.make_tensor(ids_ptr, cute.make_layout(rows * TOP_K))
         g1a = cute.make_tensor(g1a_ptr, cute.make_layout(EXPERTS))
         g1c = cute.make_tensor(g1c_ptr, cute.make_layout(EXPERTS))
         g2a = cute.make_tensor(g2a_ptr, cute.make_layout(EXPERTS))
-        hb = cute.make_tensor(
-            hb_ptr, cute.make_layout(EXPERTS * self.cta_n * (INTER // 2))
+        mb = cute.make_tensor(
+            cute.recast_ptr(x_ptr, dtype=Uint8),
+            cute.make_layout(rows * (HIDDEN // 2)),
         )
-        hs = cute.make_tensor(hs_ptr, cute.make_layout(EXPERTS * HS_SLOT_BYTES))
+        ms = cute.make_tensor(
+            cute.recast_ptr(xs_ptr, dtype=Uint8),
+            cute.make_layout(rows * (HIDDEN // 16)),
+        )
+        mbc = cute.make_tensor(
+            cute.recast_ptr(xc_ptr, dtype=Uint8),
+            cute.make_layout(MAX_CROWS * (HIDDEN // 2)),
+        )
+        msc = cute.make_tensor(
+            cute.recast_ptr(xcs_ptr, dtype=Uint8),
+            cute.make_layout(MAX_CHUNKS * XS_CHUNK_BYTES),
+        )
+        hb = cute.make_tensor(
+            cute.recast_ptr(h_ptr, dtype=Uint8),
+            cute.make_layout(MAX_CROWS * (INTER // 2)),
+        )
+        hs = cute.make_tensor(
+            hs_ptr, cute.make_layout(MAX_CHUNKS * HS_CHUNK_BYTES)
+        )
         ws = cute.make_tensor(ws_ptr, cute.make_layout(WS_WORDS))
         out = cute.make_tensor(out_ptr, cute.make_layout(rows * TOP_K * (HIDDEN // 2)))
         self.kernel(
@@ -612,7 +669,7 @@ class RoutedExpertsKernel:
             tma_tensor_b1,
             tma_b2,
             tma_tensor_b2,
-            (xs, ids, g1a, g1c, g2a, hb, hs, ws, out),
+            (ids, g1a, g1c, g2a, mb, ms, mbc, msc, hb, hs, ws, out),
             w2_ptr,
             w2s_ptr,
             rows,
@@ -621,7 +678,6 @@ class RoutedExpertsKernel:
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
-            self.sfx_smem_layout,
         ).launch(
             grid=(ctas, 1, 1),
             block=[THREADS, 1, 1],
@@ -655,9 +711,8 @@ class RoutedExpertsKernel:
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
-        sfx_smem_layout: cute.Layout,
     ):
-        mXS, mIds, mG1a, mG1c, mG2a, mHB, mHS, mWS, mOut = side
+        mIds, mG1a, mG1c, mG2a, mB, mS, mBC, mSC, mHB, mHS, mWS, mOut = side
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         lane = cute.arch.lane_idx()
@@ -681,23 +736,21 @@ class RoutedExpertsKernel:
             acc_empty: cute.struct.MemRange[Int64, 2]
             ring_full: cute.struct.MemRange[Int64, RING]
             ring_empty: cute.struct.MemRange[Int64, RING]
-            xs_ready: Int64
             tmem_bar: Int64
             tmem_base: cute.struct.MemRange[Int32, 1]
             ring: cute.struct.MemRange[Int32, RING]
-            n_slots: cute.struct.MemRange[Int32, 1]
-            # By expert: token masks (two words), H row base.
-            mask_lo: cute.struct.MemRange[Uint32, EXPERTS]
-            mask_hi: cute.struct.MemRange[Uint32, EXPERTS]
-            base_of: cute.struct.MemRange[Int32, EXPERTS]
-            # By slot: expert, compact row base, token mask.
-            slot_expert: cute.struct.MemRange[Int32, EXPERTS]
-            slot_base: cute.struct.MemRange[Int32, EXPERTS]
-            slot_mask: cute.struct.MemRange[Uint64, EXPERTS]
+            n_chunks: cute.struct.MemRange[Int32, 1]
+            # By expert: routing mask (four 32-token words), first chunk, or -1.
+            masks: cute.struct.MemRange[Uint32, EXPERTS * 4]
+            chunk_of: cute.struct.MemRange[Int32, EXPERTS]
+            # By chunk: expert, and the tokens it holds (1..N_COLS).
+            chunk_expert: cute.struct.MemRange[Int32, MAX_CHUNKS]
+            chunk_ncols: cute.struct.MemRange[Int32, MAX_CHUNKS]
             warp_sums: cute.struct.MemRange[Int32, 16]
-            # Compact row (slot base + rank) -> route 8 t + k.
-            row_route: cute.struct.MemRange[Int32, MAX_ROWS * TOP_K]
-            # Route -> the next route of the same token and expert, or -1.
+            # Compact row -> route 8 t + k, and -> token; route -> the next
+            # route of the same token and expert, or -1.
+            row_route: cute.struct.MemRange[Int32, MAX_CROWS]
+            row_token: cute.struct.MemRange[Int32, MAX_CROWS]
             dup_next: cute.struct.MemRange[Int32, MAX_ROWS * TOP_K]
 
         smem = cutlass.utils.SmemAllocator()
@@ -708,30 +761,26 @@ class RoutedExpertsKernel:
         acc_empty = storage.acc_empty.data_ptr()
         ring_full = storage.ring_full.data_ptr()
         ring_empty = storage.ring_empty.data_ptr()
-        xs_ready = storage.xs_ready.ptr
         tmem_bar = storage.tmem_bar.ptr
         ring = cute.make_tensor(storage.ring.data_ptr(), cute.make_layout(RING))
-        mask_lo = cute.make_tensor(
-            storage.mask_lo.data_ptr(), cute.make_layout(EXPERTS)
+        masks = cute.make_tensor(
+            storage.masks.data_ptr(), cute.make_layout(EXPERTS * 4)
         )
-        mask_hi = cute.make_tensor(
-            storage.mask_hi.data_ptr(), cute.make_layout(EXPERTS)
+        chunk_of = cute.make_tensor(
+            storage.chunk_of.data_ptr(), cute.make_layout(EXPERTS)
         )
-        base_of = cute.make_tensor(
-            storage.base_of.data_ptr(), cute.make_layout(EXPERTS)
+        chunk_expert = cute.make_tensor(
+            storage.chunk_expert.data_ptr(), cute.make_layout(MAX_CHUNKS)
         )
-        slot_expert = cute.make_tensor(
-            storage.slot_expert.data_ptr(), cute.make_layout(EXPERTS)
-        )
-        slot_base = cute.make_tensor(
-            storage.slot_base.data_ptr(), cute.make_layout(EXPERTS)
-        )
-        slot_mask = cute.make_tensor(
-            storage.slot_mask.data_ptr(), cute.make_layout(EXPERTS)
+        chunk_ncols = cute.make_tensor(
+            storage.chunk_ncols.data_ptr(), cute.make_layout(MAX_CHUNKS)
         )
         warp_sums = cute.make_tensor(storage.warp_sums.data_ptr(), cute.make_layout(16))
         row_route = cute.make_tensor(
-            storage.row_route.data_ptr(), cute.make_layout(MAX_ROWS * TOP_K)
+            storage.row_route.data_ptr(), cute.make_layout(MAX_CROWS)
+        )
+        row_token = cute.make_tensor(
+            storage.row_token.data_ptr(), cute.make_layout(MAX_CROWS)
         )
         dup_next = cute.make_tensor(
             storage.dup_next.data_ptr(), cute.make_layout(MAX_ROWS * TOP_K)
@@ -748,7 +797,6 @@ class RoutedExpertsKernel:
                 for s in cutlass.range_constexpr(RING):
                     cute.arch.mbarrier_init(ring_full + s, 1)
                     cute.arch.mbarrier_init(ring_empty + s, 3)
-                cute.arch.mbarrier_init(xs_ready, THREADS - 96)
                 # The MMA warp allocates; the epilogue reads, then both
                 # arrive again before the MMA warp frees it.
                 cute.arch.mbarrier_init(tmem_bar, 32 + 128)
@@ -776,42 +824,38 @@ class RoutedExpertsKernel:
             layout=sfb_smem_layout_staged,
             byte_alignment=128,
         )
-        sSFX = smem.allocate_tensor(
-            element_type=self.sf_dtype,
-            layout=sfx_smem_layout,
-            byte_alignment=128,
-        )
 
-        # The routing table, by every thread.
+        # The routing table, by every thread (thread ``tidx`` is expert
+        # ``tidx``).
         cute.arch.griddepcontrol_wait()
-        mask_lo[tidx] = Uint32(0)
-        mask_hi[tidx] = Uint32(0)
+        for w in cutlass.range_constexpr(4):
+            masks[tidx * 4 + w] = Uint32(0)
+        for r in cutlass.range(tidx, MAX_CROWS, THREADS, unroll=1):
+            row_route[r] = Int32(-1)
+            row_token[r] = Int32(0)
+        for r in cutlass.range(tidx, MAX_ROWS * TOP_K, THREADS, unroll=1):
+            dup_next[r] = Int32(-1)
         cute.arch.sync_threads()
         routes = rows * TOP_K
         for r in cutlass.range(tidx, routes, THREADS, unroll=1):
             expert = mIds[r]
             token = r // TOP_K
             if expert >= 0 and expert < EXPERTS:
-                if token < 32:
-                    cute.arch.atomic_or(
-                        mask_lo.iterator + expert,
-                        Uint32(1) << Uint32(token),
-                        scope="cta",
-                    )
-                else:
-                    cute.arch.atomic_or(
-                        mask_hi.iterator + expert,
-                        Uint32(1) << Uint32(token - 32),
-                        scope="cta",
-                    )
+                cute.arch.atomic_or(
+                    masks.iterator + (expert * 4 + token // 32),
+                    Uint32(1) << Uint32(token % 32),
+                    scope="cta",
+                )
         cute.arch.sync_threads()
-        my_mask = (Uint64(mask_hi[tidx]) << Uint64(32)) | Uint64(mask_lo[tidx])
-        count = Int32(cute.arch.popc(my_mask))
+        count = Int32(0)
+        for w in cutlass.range_constexpr(4):
+            count += Int32(cute.arch.popc(masks[tidx * 4 + w]))
+        chunks = (count + N_COLS - 1) // N_COLS
         present = Int32(0)
         if count > 0:
             present = Int32(1)
-        # Inclusive warp scans of (present, count), packed in one word.
-        packed = present * 65536 + count
+        # Inclusive warp scans of (present, chunks), packed in one word.
+        packed = present * 65536 + chunks
         for shift in cutlass.range_constexpr(5):
             other = cute.arch.shuffle_sync_up(packed, 1 << shift)
             if lane >= (1 << shift):
@@ -824,20 +868,23 @@ class RoutedExpertsKernel:
             if w < warp_idx:
                 before = before + warp_sums[w]
         inclusive = before + packed
-        slot = inclusive // 65536 - present
-        base = inclusive % 65536 - count
-        base_of[tidx] = base
+        # The chunk prefix (experts hold 1..16 chunks), not the expert slot.
+        first_chunk = inclusive % 65536 - chunks
+        chunk_of[tidx] = Int32(-1)
         if present == 1:
-            slot_expert[slot] = tidx
-            slot_base[slot] = base
-            slot_mask[slot] = my_mask
-        n_slots_t = cute.make_tensor(storage.n_slots.data_ptr(), cute.make_layout(1))
+            chunk_of[tidx] = first_chunk
+            for j in cutlass.range(chunks, unroll=1):
+                left = count - j * N_COLS
+                ncols = left
+                if left > N_COLS:
+                    ncols = Int32(N_COLS)
+                chunk_expert[first_chunk + j] = tidx
+                chunk_ncols[first_chunk + j] = ncols
+        n_chunks_t = cute.make_tensor(storage.n_chunks.data_ptr(), cute.make_layout(1))
         if tidx == THREADS - 1:
-            n_slots_t[0] = inclusive // 65536
+            n_chunks_t[0] = inclusive % 65536
         cute.arch.sync_threads()
-        for r in cutlass.range(tidx, routes, THREADS, unroll=1):
-            dup_next[r] = Int32(-1)
-        cute.arch.sync_threads()
+        # Each route's compact row, and the repeats of one expert in a token.
         for r in cutlass.range(tidx, routes, THREADS, unroll=1):
             expert = mIds[r]
             if expert >= 0 and expert < EXPERTS:
@@ -850,14 +897,61 @@ class RoutedExpertsKernel:
                 if earlier >= 0:
                     dup_next[earlier] = r
                 else:
-                    full = (Uint64(mask_hi[expert]) << Uint64(32)) | Uint64(
-                        mask_lo[expert]
-                    )
-                    row_route[base_of[expert] + tile_rank(full, token)] = r
+                    row = chunk_of[expert] * N_COLS + chunk_rank(masks, expert, token)
+                    row_route[row] = r
+                    row_token[row] = token
         cute.arch.sync_threads()
-        n_slots = n_slots_t[0]
-        g1_items = n_slots * G1_ITEMS
-        total = n_slots * SLOT_ITEMS
+        # The padding rows of a chunk read a valid token's row, so that the
+        # gather below has a source for every compact row it fills.
+        if present == 1:
+            first_row = first_chunk * N_COLS
+            for j in cutlass.range(chunks * N_COLS - count, unroll=1):
+                row_token[first_row + count + j] = row_token[first_row]
+        cute.arch.sync_threads()
+        n_chunks = n_chunks_t[0]
+        g1_items = n_chunks * G1_ITEMS
+        total = n_chunks * CHUNK_ITEMS
+        crows = n_chunks * N_COLS
+
+        # Gather each chunk's activation rows and block scales: the GEMMs read
+        # the compact arrays, so the activation traffic follows the routing
+        # instead of the batch.
+        cta, _, _ = cute.arch.block_idx()
+        for r in cutlass.range(cta, crows, grid, unroll=1):
+            token = row_token[r]
+            off = tidx * 8
+            lo, hi = load_v2(mB.iterator + token * (HIDDEN // 2) + off)
+            store_v2(mBC.iterator + r * (HIDDEN // 2) + off, lo, hi)
+        gtid = cta * THREADS + tidx
+        tasks = crows * (HIDDEN // 64)
+        for task in cutlass.range(gtid, tasks, grid * THREADS, unroll=1):
+            r = task // (HIDDEN // 64)
+            block = task - r * (HIDDEN // 64)
+            store_u32(
+                mSC.iterator
+                + (r // N_COLS) * XS_CHUNK_BYTES
+                + block * 512
+                + (r % N_COLS) * 16,
+                load_u32(
+                    mS.iterator + row_token[r] * (HIDDEN // 16) + block * 4
+                ),
+            )
+        # Zero the rows of routes to no local expert (one CTA per route).
+        for r in cutlass.range(cta, routes, grid, unroll=1):
+            expert = mIds[r]
+            if expert < 0 or expert >= EXPERTS:
+                for w in cutlass.range(
+                    tidx * 2, HIDDEN // 2, THREADS * 2, unroll=1
+                ):
+                    store_zero_v2(mOut.iterator + (r * (HIDDEN // 2) + w))
+        # The GEMMs of every CTA read every chunk: wait for the whole gather.
+        cute.arch.sync_threads()
+        if tidx == 0:
+            release_add(mWS.iterator + WS_GATHER, 1)
+            while load_acquire(mWS.iterator + WS_GATHER) < grid:
+                pass
+            fence_proxy_async_global()
+        cute.arch.sync_threads()
 
         mma_coord = Int32(0)
         thr_mma = tiled_mma.get_slice(mma_coord)
@@ -940,9 +1034,9 @@ class RoutedExpertsKernel:
                 if lane == 0:
                     upcoming = atomic_add_relaxed(queue, 1)
                 if item < g1_items:
-                    slot = item // G1_ITEMS
-                    m_tile = item - slot * G1_ITEMS
-                    expert = slot_expert[slot]
+                    chunk = item // G1_ITEMS
+                    m_tile = item - chunk * G1_ITEMS
+                    expert = chunk_expert[chunk]
                     tAgA = tAgA1[(None, m_tile, None, expert)]
                     tAgSFA = tAgSFA1[(None, m_tile, None, expert)]
                     for k_tile in cutlass.range(G1_K_TILES, unroll=1):
@@ -971,9 +1065,9 @@ class RoutedExpertsKernel:
                             phase ^= 1
                 else:
                     j = item - g1_items
-                    slot = j // G2_M_TILES
-                    m_tile = j - slot * G2_M_TILES
-                    expert = slot_expert[slot]
+                    chunk = j // G2_M_TILES
+                    m_tile = j - chunk * G2_M_TILES
+                    expert = chunk_expert[chunk]
                     if lane == 0:
                         # The whole tile into L2 now: GEMM2 items may wait
                         # for their H with the stages full.
@@ -1022,8 +1116,8 @@ class RoutedExpertsKernel:
                     stage = Int32(0)
                     phase ^= 1
         elif warp_idx == 1:
-            # B (input or H) and B's scales.
-            cute.arch.griddepcontrol_wait()
+            # B (the chunk's activation rows or its intermediate rows) and B's
+            # block scales.
             b_cta_layout = cute.make_layout(
                 cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
             )
@@ -1064,12 +1158,20 @@ class RoutedExpertsKernel:
             while item < total:
                 consumed += 1
                 if item < g1_items:
-                    tBgB = tBgB1[(None, 0, None, 0)]
+                    chunk = item // G1_ITEMS
+                    tBgB = tBgB1[(None, chunk, None, 0)]
+                    scale_base = mSC.iterator + chunk * XS_CHUNK_BYTES
                     for k_tile in cutlass.range(G1_K_TILES, unroll=1):
                         cute.arch.mbarrier_wait(ab_empty + stage, phase)
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
-                                ab_full + stage, self.tma_bytes_b
+                                ab_full + stage, self.tma_bytes_b + STAGE_SFB_BYTES
+                            )
+                            bulk_load(
+                                sSFB.iterator + stage * sfb_stage_bytes,
+                                scale_base + k_tile * STAGE_SFB_BYTES,
+                                STAGE_SFB_BYTES,
+                                ab_full + stage,
                             )
                         cute.copy(
                             tma_b1,
@@ -1083,26 +1185,27 @@ class RoutedExpertsKernel:
                             phase ^= 1
                 else:
                     j = item - g1_items
-                    slot = j // G2_M_TILES
+                    chunk = j // G2_M_TILES
                     if lane == 0:
-                        flag = mWS.iterator + WS_FLAGS + slot
+                        flag = mWS.iterator + WS_FLAGS + chunk
                         polls = Int32(0)
                         while load_acquire(flag) < G1_ITEMS:
                             if cutlass.const_expr(self.spin_limit > 0):
                                 polls += 1
                                 if polls > self.spin_limit:
                                     cute.printf(
-                                        "routed experts: CTA %d waits for slot %d "
+                                        "routed experts: CTA %d waits for chunk %d "
                                         "(expert %d), counter %d\n",
                                         cute.arch.block_idx()[0],
-                                        slot,
-                                        slot_expert[slot],
+                                        chunk,
+                                        chunk_expert[chunk],
                                         load_acquire(flag),
                                     )
                                     trap()
                         fence_proxy_async_global()
                     cute.arch.sync_warp()
-                    tBgB = tBgB2[(None, slot, None, 0)]
+                    tBgB = tBgB2[(None, chunk, None, 0)]
+                    scale_base = mHS.iterator + chunk * HS_CHUNK_BYTES
                     for k_tile in cutlass.range(G2_K_TILES, unroll=1):
                         cute.arch.mbarrier_wait(ab_empty + stage, phase)
                         with cute.arch.elect_one():
@@ -1111,8 +1214,7 @@ class RoutedExpertsKernel:
                             )
                             bulk_load(
                                 sSFB.iterator + stage * sfb_stage_bytes,
-                                mHS.iterator
-                                + (slot * HS_SLOT_BYTES + k_tile * STAGE_SFB_BYTES),
+                                scale_base + k_tile * STAGE_SFB_BYTES,
                                 STAGE_SFB_BYTES,
                                 ab_full + stage,
                             )
@@ -1137,45 +1239,17 @@ class RoutedExpertsKernel:
                 ring,
                 ring_full,
                 ring_empty,
-                xs_ready,
                 tmem_bar,
                 tiled_mma,
                 sA,
                 sB,
                 sSFA,
                 sSFB,
-                sSFX,
                 sfa_smem_layout_staged,
                 sfb_smem_layout_staged,
                 g1_items,
                 total,
             )
-        if warp_idx >= 3:
-            # The input's scales into GEMM1's resident B-scale atoms.
-            cute.arch.griddepcontrol_wait()
-            words = cute.make_tensor(
-                cute.recast_ptr(sSFX.iterator, dtype=Uint32),
-                cute.make_layout(G1_K_TILES * STAGE_SFB_BYTES // 4),
-            )
-            for w in cutlass.range(
-                tidx - 96, rows * (HIDDEN // 64), THREADS - 96, unroll=1
-            ):
-                token = w // (HIDDEN // 64)
-                chunk = w - token * (HIDDEN // 64)
-                words[(chunk * 512 + (token % 32) * 16 + (token // 32) * 4) // 4] = mXS[
-                    w
-                ]
-            cute.arch.fence_proxy("async.shared", space="cta")
-            cute.arch.mbarrier_arrive(xs_ready)
-            # Zero the rows of routes to no local expert (one CTA per route).
-            cta, _, _ = cute.arch.block_idx()
-            for r in cutlass.range(cta, rows * TOP_K, grid, unroll=1):
-                expert = mIds[r]
-                if expert < 0 or expert >= EXPERTS:
-                    for w in cutlass.range(
-                        (tidx - 96) * 2, HIDDEN // 2, (THREADS - 96) * 2, unroll=1
-                    ):
-                        store_zero_v2(mOut.iterator + (r * (HIDDEN // 2) + w))
         if warp_idx >= EPI_WARP:
             self.epilogue(
                 storage,
@@ -1185,9 +1259,8 @@ class RoutedExpertsKernel:
                 ring_full,
                 ring_empty,
                 tmem_bar,
-                slot_expert,
-                slot_base,
-                slot_mask,
+                chunk_expert,
+                chunk_ncols,
                 row_route,
                 mG1a,
                 mG1c,
@@ -1205,8 +1278,9 @@ class RoutedExpertsKernel:
             # The last CTA to finish resets the workspace for the next call.
             done = atomic_add_acq_rel(mWS.iterator + WS_DONE, 1)
             if done == grid - 1:
-                for s in cutlass.range(n_slots, unroll=1):
+                for s in cutlass.range(n_chunks, unroll=1):
                     store_relaxed(mWS.iterator + WS_FLAGS + s, 0)
+                store_relaxed(mWS.iterator + WS_GATHER, 0)
                 store_relaxed(mWS.iterator + WS_QUEUE, 0)
                 store_relaxed(mWS.iterator + WS_DONE, 0)
 
@@ -1259,14 +1333,12 @@ class RoutedExpertsKernel:
         ring,
         ring_full,
         ring_empty,
-        xs_ready,
         tmem_bar,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,
         sB: cute.Tensor,
         sSFA: cute.Tensor,
         sSFB: cute.Tensor,
-        sSFX: cute.Tensor,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         g1_items: Int32,
@@ -1307,14 +1379,12 @@ class RoutedExpertsKernel:
         )
         copy_sfa, tCsSFA_s2t, tCtSFA_s2t = self._s2t_copy(sSFA, tCtSFA)
         copy_sfb, tCsSFB_s2t, tCtSFB_s2t = self._s2t_copy(sSFB, tCtSFB)
-        copy_sfx, tCsSFX_s2t, tCtSFX_s2t = self._s2t_copy(sSFX, tCtSFB)
 
         stage = Int32(0)
         phase = Int32(0)
         acc_stage = Int32(0)
         acc_phase = Int32(1)
         consumed = Int32(0)
-        xs_waited = Int32(0)
         item = self.consume(
             ring, ring_full, ring_empty, consumed, cute.arch.lane_idx() == 0
         )
@@ -1323,9 +1393,6 @@ class RoutedExpertsKernel:
             cute.arch.mbarrier_wait(acc_empty + acc_stage, acc_phase)
             tCtAcc = tCtAcc_base[(None, None, None, acc_stage)]
             if item < g1_items:
-                if xs_waited == 0:
-                    cute.arch.mbarrier_wait(xs_ready, 0)
-                    xs_waited = Int32(1)
                 for k_tile in cutlass.range(G1_K_TILES, unroll=1):
                     cute.arch.mbarrier_wait(ab_full + stage, phase)
                     cute.copy(
@@ -1334,9 +1401,9 @@ class RoutedExpertsKernel:
                         tCtSFA_s2t,
                     )
                     cute.copy(
-                        copy_sfx,
-                        tCsSFX_s2t[(None, None, None, None, k_tile)],
-                        tCtSFX_s2t,
+                        copy_sfb,
+                        tCsSFB_s2t[(None, None, None, None, stage)],
+                        tCtSFB_s2t,
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
                     operand = (None, None, None, stage)
@@ -1406,9 +1473,8 @@ class RoutedExpertsKernel:
         ring_full,
         ring_empty,
         tmem_bar,
-        slot_expert: cute.Tensor,
-        slot_base: cute.Tensor,
-        slot_mask: cute.Tensor,
+        chunk_expert: cute.Tensor,
+        chunk_ncols: cute.Tensor,
         row_route: cute.Tensor,
         mG1a: cute.Tensor,
         mG1c: cute.Tensor,
@@ -1422,8 +1488,8 @@ class RoutedExpertsKernel:
         dup_next: cute.Tensor,
     ):
         """Thread (warp w, lane = 4 s + c) reads accumulator rows 32 w + s +
-        8 i (i < 4) of columns 8 chunk + 2 c, + 1; with the 128-row shuffle
-        they are rows 32 w + 4 s + i of the weight tile."""
+        8 i (i < 4) of columns 2 c, 2 c + 1 (the chunk's tokens); with the
+        128-row shuffle they are rows 32 w + 4 s + i of the weight tile."""
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - EPI_WARP
         lane = cute.arch.lane_idx()
         tid = warp * 32 + lane
@@ -1442,121 +1508,109 @@ class RoutedExpertsKernel:
             cute.arch.mbarrier_wait(acc_full + acc_stage, acc_phase)
             column0 = Uint32(tmem) + Uint32(acc_stage * self.cta_n) + lanes
             if item < g1_items:
-                slot = item // G1_ITEMS
-                m_tile = item - slot * G1_ITEMS
-                expert = slot_expert[slot]
-                mask = slot_mask[slot]
-                h_row0 = slot * self.cta_n
+                chunk = item // G1_ITEMS
+                m_tile = item - chunk * G1_ITEMS
+                expert = chunk_expert[chunk]
+                ncols = chunk_ncols[chunk]
+                h_row0 = chunk * N_COLS
                 scale_gate = mG1a[expert]
                 scale_c = mG1c[expert]
                 k = mul_ftz(scale_gate, Float32(1.4426950216293334961))
                 h_col = m_tile * 32 + warp * 8 + s
-                for chunk in cutlass.range_constexpr(self.cta_n // 8):
-                    bits = (mask >> Uint64(chunk * 8)) & Uint64(255)
-                    if bits != Uint64(0):
-                        v = tmem_load_8x8(
-                            column0 + Uint32(chunk * 8),
-                            column0 + Uint32(chunk * 8) + (Uint32(16) << Uint32(16)),
+                v = tmem_load_8x8(
+                    column0,
+                    column0 + (Uint32(16) << Uint32(16)),
+                )
+                # Columns p (rows s, s + 8) and p + 1 (rows s + 16, s + 24):
+                # up then gate, tokens a and a + 1.
+                ha0, hb0 = swiglu_x2(v[0], v[1], v[2], v[3], k, scale_gate)
+                ha1, hb1 = swiglu_x2(v[4], v[5], v[6], v[7], k, scale_gate)
+                amax_a, amax_b = block_amax_x2(ha0, ha1, hb0, hb1, scale_c)
+                for shift in cutlass.range_constexpr(4, 1, -1):
+                    amax_a = max_ftz(
+                        amax_a, cute.arch.shuffle_sync_bfly(amax_a, 1 << shift)
+                    )
+                    amax_b = max_ftz(
+                        amax_b, cute.arch.shuffle_sync_bfly(amax_b, 1 << shift)
+                    )
+                sf, inv_a, inv_b = block_scale_x2(amax_a, amax_b)
+                code_a = quantize_e2m1x2(ha0, ha1, inv_a, scale_c)
+                code_b = quantize_e2m1x2(hb0, hb1, inv_b, scale_c)
+                token_a = 2 * c
+                if token_a < ncols:
+                    store_u8(
+                        mHB.iterator + ((h_row0 + token_a) * (INTER // 2) + h_col),
+                        code_a,
+                    )
+                    if s == 0:
+                        store_u8(
+                            mHS.iterator
+                            + (
+                                chunk * HS_CHUNK_BYTES
+                                + m_tile * 512
+                                + token_a * 16
+                                + warp
+                            ),
+                            sf & Uint32(255),
                         )
-                        # Columns p (rows s, s + 8) and p + 1 (rows s + 16,
-                        # s + 24): up then gate, tokens a and a + 1.
-                        ha0, hb0 = swiglu_x2(v[0], v[1], v[2], v[3], k, scale_gate)
-                        ha1, hb1 = swiglu_x2(v[4], v[5], v[6], v[7], k, scale_gate)
-                        amax_a, amax_b = block_amax_x2(ha0, ha1, hb0, hb1, scale_c)
-                        for shift in cutlass.range_constexpr(4, 1, -1):
-                            amax_a = max_ftz(
-                                amax_a, cute.arch.shuffle_sync_bfly(amax_a, 1 << shift)
-                            )
-                            amax_b = max_ftz(
-                                amax_b, cute.arch.shuffle_sync_bfly(amax_b, 1 << shift)
-                            )
-                        sf, inv_a, inv_b = block_scale_x2(amax_a, amax_b)
-                        code_a = quantize_e2m1x2(ha0, ha1, inv_a, scale_c)
-                        code_b = quantize_e2m1x2(hb0, hb1, inv_b, scale_c)
-                        token_a = chunk * 8 + 2 * c
-                        if (mask >> Uint64(token_a)) & Uint64(1) != Uint64(0):
-                            rank = tile_rank(mask, token_a)
-                            store_u8(
-                                mHB.iterator + ((h_row0 + rank) * (INTER // 2) + h_col),
-                                code_a,
-                            )
-                            if s == 0:
-                                store_u8(
-                                    mHS.iterator
-                                    + (
-                                        slot * HS_SLOT_BYTES
-                                        + m_tile * 512
-                                        + (rank % 32) * 16
-                                        + (rank // 32) * 4
-                                        + warp
-                                    ),
-                                    sf & Uint32(255),
-                                )
-                        if (mask >> Uint64(token_a + 1)) & Uint64(1) != Uint64(0):
-                            rank = tile_rank(mask, token_a + 1)
-                            store_u8(
-                                mHB.iterator + ((h_row0 + rank) * (INTER // 2) + h_col),
-                                code_b,
-                            )
-                            if s == 0:
-                                store_u8(
-                                    mHS.iterator
-                                    + (
-                                        slot * HS_SLOT_BYTES
-                                        + m_tile * 512
-                                        + (rank % 32) * 16
-                                        + (rank // 32) * 4
-                                        + warp
-                                    ),
-                                    sf >> Uint32(8),
-                                )
+                if token_a + 1 < ncols:
+                    store_u8(
+                        mHB.iterator
+                        + ((h_row0 + token_a + 1) * (INTER // 2) + h_col),
+                        code_b,
+                    )
+                    if s == 0:
+                        store_u8(
+                            mHS.iterator
+                            + (
+                                chunk * HS_CHUNK_BYTES
+                                + m_tile * 512
+                                + (token_a + 1) * 16
+                                + warp
+                            ),
+                            sf >> Uint32(8),
+                        )
                 cute.arch.fence_view_async_tmem_load()
                 cute.arch.mbarrier_arrive(acc_empty + acc_stage)
-                # H of this item is out: count it for the slot's GEMM2 items.
+                # H of this item is out: count it for the chunk's GEMM2 items.
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 if tid == 0:
-                    release_add(mWS.iterator + WS_FLAGS + slot, 1)
+                    release_add(mWS.iterator + WS_FLAGS + chunk, 1)
             else:
                 j = item - g1_items
-                slot = j // G2_M_TILES
-                m_tile = j - slot * G2_M_TILES
-                expert = slot_expert[slot]
-                mask = slot_mask[slot]
-                count = Int32(cute.arch.popc(mask))
-                base = slot_base[slot]
+                chunk = j // G2_M_TILES
+                m_tile = j - chunk * G2_M_TILES
+                expert = chunk_expert[chunk]
+                ncols = chunk_ncols[chunk]
                 scale = mG2a[expert]
                 hidden = m_tile * CTA_M + warp * 32 + 4 * s
-                for chunk in cutlass.range_constexpr(self.cta_n // 8):
-                    if chunk * 8 < count:
-                        v = tmem_load_8x8(
-                            column0 + Uint32(chunk * 8),
-                            column0 + Uint32(chunk * 8) + (Uint32(16) << Uint32(16)),
+                v = tmem_load_8x8(
+                    column0,
+                    column0 + (Uint32(16) << Uint32(16)),
+                )
+                token_a = 2 * c
+                if token_a < ncols:
+                    lo = scaled_bf16x2(v[0], v[2], scale)
+                    hi = scaled_bf16x2(v[4], v[6], scale)
+                    route = row_route[chunk * N_COLS + token_a]
+                    while route >= 0:
+                        store_v2(
+                            mOut.iterator + (route * (HIDDEN // 2) + hidden // 2),
+                            lo,
+                            hi,
                         )
-                        rank = chunk * 8 + 2 * c
-                        if rank < count:
-                            lo = scaled_bf16x2(v[0], v[2], scale)
-                            hi = scaled_bf16x2(v[4], v[6], scale)
-                            route = row_route[base + rank]
-                            while route >= 0:
-                                store_v2(
-                                    mOut.iterator
-                                    + (route * (HIDDEN // 2) + hidden // 2),
-                                    lo,
-                                    hi,
-                                )
-                                route = dup_next[route]
-                        if rank + 1 < count:
-                            lo = scaled_bf16x2(v[1], v[3], scale)
-                            hi = scaled_bf16x2(v[5], v[7], scale)
-                            route = row_route[base + rank + 1]
-                            while route >= 0:
-                                store_v2(
-                                    mOut.iterator
-                                    + (route * (HIDDEN // 2) + hidden // 2),
-                                    lo,
-                                    hi,
-                                )
-                                route = dup_next[route]
+                        route = dup_next[route]
+                if token_a + 1 < ncols:
+                    lo = scaled_bf16x2(v[1], v[3], scale)
+                    hi = scaled_bf16x2(v[5], v[7], scale)
+                    route = row_route[chunk * N_COLS + token_a + 1]
+                    while route >= 0:
+                        store_v2(
+                            mOut.iterator + (route * (HIDDEN // 2) + hidden // 2),
+                            lo,
+                            hi,
+                        )
+                        route = dup_next[route]
                 cute.arch.fence_view_async_tmem_load()
                 cute.arch.mbarrier_arrive(acc_empty + acc_stage)
             acc_stage += 1
