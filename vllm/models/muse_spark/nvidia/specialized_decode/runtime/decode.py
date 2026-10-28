@@ -213,10 +213,8 @@ def fused_qkv_projection(attn: "MuseSpark1xAttention") -> "QkvProjection | None"
     return projection.prepare(range(1, QKV_FUSED_MAX_ROWS + 1), kv_out=False)
 
 
-# Rows of router input the fused router serves: from 8 rows up it beats the
-# stock router GEMM + routing chain it replaces (isolated, cold weights: 6.3 vs
-# 7.6 us at 8 rows, 10.3 vs 12.8 us at 64; 19 us a layer in-layer at 64 rows, so
-# the gate stays wider than the 32 rows that open the FP32 window).
+# Rows of router input the fused router serves (faster than the stock router
+# GEMM and routing kernel there, on B300).
 ROUTER_ROWS = range(8, 129)
 # The router input dtypes it serves. Both take the same exact kernel: FP32
 # activations split into three BF16 terms like the weight. Isolated on B300 the
