@@ -50,7 +50,6 @@ from ...model import (
     o_norm_sigmoid_gate,
 )
 from .. import MAX_EXPERT_ROWS, MAX_ROWS, DecodeConfig
-from ..tail.tail import ONESHOT_TOKENS
 from .linear import (
     O_PROJ_TACTICS,
     POOLER_TACTICS,
@@ -70,7 +69,6 @@ if TYPE_CHECKING:
     from ..boundary.boundary import Published
     from ..experts.routed_experts import MuseRoutedExperts
     from ..moe.router import MuseRouter
-    from ..tail.experts import PublishingRoutedExperts
     from ..tail.tail import MoeTail
 
 DecodeOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
@@ -285,10 +283,6 @@ class LayerPlan(NamedTuple):
     # This rank's output columns of the MoE projections.
     pooler: DecodeProjection
     unpooler: DecodeProjection
-    # The routed experts publishing into the MoE tail at this layer's parity,
-    # for the layers whose FFN branch the tail publishes.
-    tail_experts: "PublishingRoutedExperts | None" = None
-    tail_parity: int | None = None
 
 
 def captures_pure_decode(layer_names: list[str]) -> bool:
@@ -381,15 +375,13 @@ class SpecializedDecode:
         self.captured_steps = 0
 
     def _build_tail(self, aux_layers) -> "MoeTail | None":
-        """The fused MoE tail and the publishing experts of the layers it
-        serves: NVFP4 layers whose FFN branch goes to the next boundary rather
-        than to the draft model's aux hidden states."""
+        """The fused MoE tail, for the NVFP4 layers whose FFN branch goes to
+        the next boundary rather than to the draft model's aux hidden states."""
         if self.boundaries.unpooler is None:
             return None
         if not TAIL_BOUND:
             return None
-        from ..tail.experts import PublishingRoutedExperts
-        from ..tail.tail import MoeTail, layer_parities
+        from ..tail.tail import MoeTail
 
         served = [
             i
@@ -399,28 +391,8 @@ class SpecializedDecode:
         if not served:
             return None
         group = get_tp_group().device_group
-        tail = MoeTail(group, publisher=self.boundaries.unpooler, max_tokens=MAX_EXPERT_ROWS)
+        tail = MoeTail(group, publisher=self.boundaries.unpooler)
         tail.precompile()
-        parities = layer_parities(len(served))
-        for i, parity in zip(served, parities):
-            experts = self.plans[i].experts
-            assert experts is not None
-            self.plans[i] = self.plans[i]._replace(
-                tail_experts=PublishingRoutedExperts(
-                    experts.w13,
-                    experts.w13_scale,
-                    experts.w2,
-                    experts.w2_scale,
-                    experts.g1_alphas,
-                    experts.g1_scale_c,
-                    experts.g2_alphas,
-                    target=tail.published_target,
-                    tp=tail.tp,
-                    parities=(parity,),
-                    ids_ready=True,
-                ),
-                tail_parity=parity,
-            )
         return tail
 
     def rearm(self) -> None:
@@ -746,36 +718,19 @@ class SpecializedDecode:
         if (
             publish
             and self.tail is not None
-            and plan.tail_experts is not None
+            and plan.experts is not None
             and isinstance(routing, tuple)
             and self.tail.supports(num_tokens)
         ):
             post_norm = moe.post_expert_norm
             assert post_norm is not None
-            norm_args = dict(
-                eps=post_norm.variance_epsilon,
-                gain_center=post_norm.fused_gain_center,
-            )
-            if num_tokens <= ONESHOT_TOKENS:
-                parity = plan.tail_parity
-                unfinalized = plan.tail_experts(
-                    a1q, a1q_scale, routing[0], routing[1], parity=parity
-                )
-                return self.tail(
-                    unfinalized,
-                    post_norm.weight,
-                    plan.unpooler.weight,
-                    parity=parity,
-                    topk_ids=routing[0],
-                    **norm_args,
-                )
-            # The owner-scatter schedule publishes the rows itself, so the
-            # experts must not multicast them first: above the one-shot ceiling
-            # that would send every row twice.
-            assert plan.experts is not None
             unfinalized = plan.experts(a1q, a1q_scale, routing[0], routing[1])
             return self.tail(
-                unfinalized, post_norm.weight, plan.unpooler.weight, **norm_args
+                unfinalized,
+                post_norm.weight,
+                plan.unpooler.weight,
+                eps=post_norm.variance_epsilon,
+                gain_center=post_norm.fused_gain_center,
             )
         experts_out = self._experts(plan, a1q, a1q_scale, routing)
         if publish:
