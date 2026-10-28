@@ -121,6 +121,20 @@ granularity is *not* the cause (CTA_K=512 is bit-exactly equal at equal in-fligh
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
 target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
 
+## Final end-to-end table (medians of three paired server runs, c=1/4/8/16)
+
+| case | stock step | executor step | tok/s | note |
+| --- | --- | --- | --- | --- |
+| c=1 (8 rows) | 9.80 ms | 8.18 ms (−17 %) | 419 -> 515 (+23 %) | AL 4.17-4.31 |
+| c=4 (32 rows) | 14.04 ms | 12.00 ms (−15 %) | 1057 -> 1223 (+16 %) | |
+| c=8 (64 rows) | 16.85 ms | 16.44 ms (−2 %) | 1740 -> 1852 (+6 %) | at the cap |
+| c=16 (128 rows) | 20.29 ms | 20.29 ms | 2761 -> 2796 | stock layers (above MAX_ROWS) |
+
+Per layer the executor is ahead at every row count it serves, including 128 rows (385.9 against
+stock's 397.0), yet at concurrency 16 it is 3.4 % behind end to end in all three pairs. The gap is
+therefore outside the target forward and it is the one open performance question; until it is found
+`MAX_ROWS` stays 64 so 128-row steps run stock.
+
 ## Measurement noise (important)
 
 Two server launches of the *same* configuration differ by up to 3 % on step time at
