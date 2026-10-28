@@ -153,3 +153,20 @@ The 8..128-row gate is validated: narrowing it to <=32 rows costs +19 us/layer a
 64 rows. FP32 input now stops at 32 rows, where the fused kernel still wins
 (6.68/7.99/10.16 us against the stock chain's 8.49/12.81/23.80); above that the
 stock chain is faster (14.28/22.77 against 11.68/13.19 at 64/128).
+
+## Validation of the merged tree (after the router work)
+
+`validate.sh` on a fresh snapshot, one `chg` reservation:
+
+| | 8 rows | 16 | 32 | 64 | 128 |
+| --- | --- | --- | --- | --- | --- |
+| per layer, us | 123.9 | 165.4 | 241.2 | 328.2 | 401.4 |
+
+| end to end | stock | specialized |
+| --- | --- | --- |
+| c=1 | 9.58 ms / 440 tok/s (AL 4.34) | 8.25 ms / 496 tok/s (AL 4.18) |
+| c=4 | 13.68 ms / 1116 tok/s (AL 4.17) | 11.12 ms / 1170 tok/s (AL 3.56) |
+
+GSM8K, 400 questions: 0.963 stock against 0.950 specialized, no invalid responses
+(one standard error at n=400 is ~1.1 points, so that is a tie; the 1319-question
+run remains the authority at 0.954 against 0.957).

@@ -1,0 +1,4 @@
+tp4    c= 1 out_tok/s=   440.4 per-user= 452.9 medTPOT=  2.21ms AL= 4.34 drafted/step= 7.00 step=  9.58ms ttft_med=    42.0 dur=37s
+tp4    c= 4 out_tok/s=  1115.9 per-user= 304.7 medTPOT=  3.28ms AL= 4.17 drafted/step= 7.00 step= 13.68ms ttft_med=    63.4 dur=29s
+tp4sd  c= 1 out_tok/s=   496.1 per-user= 506.1 medTPOT=  1.98ms AL= 4.18 drafted/step= 7.00 step=  8.25ms ttft_med=    39.1 dur=33s
+tp4sd  c= 4 out_tok/s=  1169.5 per-user= 319.9 medTPOT=  3.13ms AL= 3.56 drafted/step= 7.00 step= 11.12ms ttft_med=    61.8 dur=28s
