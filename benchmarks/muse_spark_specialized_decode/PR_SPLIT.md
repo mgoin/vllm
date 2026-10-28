@@ -1,8 +1,17 @@
-# Landing this work: commit series
+# Landing this work: the series is built and verified
 
-The branch is one WIP commit on top of `main` plus the integration commits.
-Split it into these changes, in order. Each must stand alone (build, lint,
-tests) because the executor is off by default until the last one.
+The split exists as three branches on `mgoin/vllm`, each verified on this box:
+
+| branch | commits | content | verified |
+| --- | --- | --- | --- |
+| `muse-pr1-shared` | 1 | the shared primitives and the Kimi K3 import move | imports clean |
+| `muse-pr2-drafter` | 1 | the DFlash/DFlash2 drafter kernels and the opt-in quantized candidate head | 115 tests pass |
+| `muse-pr3-executor` | 1 | the Muse Spark executor, its tests, docs and the nightly CI job | 8 config-gate + 166 kernel/numerics + 2 engine-equivalence tests pass |
+
+Each is a single commit on top of the previous one, so they must land in that
+order (PR3 imports what PR1 adds; PR2 rewrites the file whose import PR1 changes).
+The `vllm/` tree at the head of `muse-pr3-executor` is byte-identical to the
+integration branch.
 
 ## 0. Shared primitives (prerequisite, no behaviour change)
 
