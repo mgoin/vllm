@@ -121,6 +121,21 @@ granularity is *not* the cause (CTA_K=512 is bit-exactly equal at equal in-fligh
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
 target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
 
+## TP4 against TP8 (stock kernels, same prompts, one node)
+
+| case | TP4 (4 GPUs) | TP8 (8 GPUs) | per-GPU tokens/s, TP4 vs TP8 |
+| --- | --- | --- | --- |
+| c=1 | 9.80 ms / 419 tok/s | 7.44 ms / 603 tok/s | 105 vs 75 |
+| c=4 | 14.04 / 1057 | 10.44 / 1470 | 264 vs 184 |
+| c=8 | 16.85 / 1740 | 12.99 / 2423 | 435 vs 303 |
+| c=16 | 20.29 / 2761 | 15.47 / 3721 | 690 vs 465 |
+
+TP8 is 23-26 % faster per step and 35-44 % higher single-instance throughput, but TP4 does 1.4-1.8x
+more tokens/s per GPU: two TP4 replicas on one node beat one TP8 replica on aggregate throughput
+(2 x 515 = 1030 tok/s at c=1 with the executor, against 603 for TP8), while TP8 wins single-stream
+latency. The executor's c=1 step (8.18 ms) is within 10 % of stock TP8's 7.44 ms while leaving half
+the node for a second replica, which is the case for keeping TP4 as the deployment shape.
+
 ## Final end-to-end table (medians of three paired server runs, c=1/4/8/16)
 
 | case | stock step | executor step | tok/s | note |
