@@ -87,6 +87,31 @@ Bytes a step must stream, per rank and layer:
 The step is a pure weight-streaming problem at every batch size. Compute is
 never the limit: even at 128 rows each expert GEMM is M=4.
 
+### The 8-row chain, exclusive critical path per layer (front agent, PROFILE replay)
+
+| stage | us/layer | share |
+| --- | --- | --- |
+| tail experts publish (persistent NVFP4 experts) | 58.2 | 48 % |
+| boundary publish GEMMs (o_proj, pooler, unpooler) | 11.4 | within 1.3x of roofline |
+| fused QKV (qk-norm + rope + kv insert) | 11.1 | ~10 us roofline |
+| router + top-k (side stream) | 8.7 | |
+| o_proj all-reduce + dual norm | 8.6 | latency-bound on the slowest rank |
+| all-gather unpooler + dual norm (FlashInfer) | 7.4 | |
+| tail finalize | 5.4 | |
+| L2 prefetch (side stream) | 4.5 | |
+| attention core | 4.3 | |
+| all-gather pooler + norm + fp4 quant | 0.5 | fully overlapped |
+
+At 16 rows the layer is 164 us and the tail experts share is 61 %. So the chain is not in the
+boundary/attention code: at 8 rows 48 % is the expert stream and the remaining ~70 us is spread over
+ten stages that are each within ~1.3x of their own roofline. The remaining c=1 levers are the expert
+kernel's stream rate, the router's 8.7 us, and the cross-rank wait inside the o_proj boundary.
+
+**Bandwidth calibration (experts agent, nsys + ncu):** a pure streaming read on this box runs at
+5.5-5.8 TB/s (80 % of a 7.66 TB/s peak), and the stock TRT-LLM expert GEMMs reach 5.99 TB/s at 128
+rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
+target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
+
 ## Executor kernel profile (8 rows and 128 rows, 8-layer truncated model, TP4, no EP)
 
 Per forward of 8 layers, rank 0 (`vllm bench forward --profile-dir`):

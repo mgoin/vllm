@@ -10,6 +10,10 @@ of expert weights, plus the dense projections and the KV cache it reads. Compute
 is never the limit: even at 256 rows each expert GEMM has four rows.
 
 python roofline.py [--rows 8 32 128] [--ctx 1024 16384] [--us per_layer_us]
+
+The expert count assumes uniform-random routing, which is the harness' worst
+case: real traffic clusters, touches fewer experts, and so reads fewer bytes.
+Read the achieved TB/s as a lower bound and the roofline time as an upper one.
 """
 
 import argparse
@@ -22,9 +26,11 @@ TP = 4
 NVFP4_BYTES = 0.5
 # Block-scale factors of NVFP4: one FP8 scale and one FP32 global per 16 values.
 SCALES_PER_PARAM = 1.0 / 16.0 * 1 + 1.0 / (16 * 4096)
-# B300 HBM3e, sustained rather than peak.
-PEAK_TBPS = 8.0
-TARGET_TBPS = 7.5
+# Measured on this box: a pure streaming read (torch.sum over 1.6 GB) runs at
+# 5.5-5.8 TB/s, which ncu puts at 80 % of the 7.66 TB/s peak; the stock TRT-LLM
+# expert GEMMs reach 5.99 TB/s. Use the achievable rate, not the peak.
+PEAK_TBPS = 7.66
+TARGET_TBPS = 6.0
 
 
 def expert_bytes() -> float:
