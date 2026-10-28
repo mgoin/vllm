@@ -166,9 +166,27 @@ def test_cuda_graph_replay(weights, projections):
             torch.testing.assert_close(cache, ref_cache, atol=0, rtol=0)
 
 
+def replay_memcpys(graph) -> list[str]:
+    """The copies a replay of ``graph`` issues. The projection prepares its TMA
+    descriptors when it is bound and the kernel points its own copy at the call's
+    input, so neither the capture nor a replay may copy anything from the host."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and "Memcpy" in event.name
+    ]
+
+
 def test_capture_with_new_input_address(weights, projections):
     """An input first seen inside the capture (a graph-pool address, as in the
-    model's capture) gets its TMA map without a pageable host copy."""
+    model's capture) gets pointed at by the kernel's own descriptor copy, and a
+    replay of that graph copies nothing from the host."""
     table = rope_table()
     weight, projection = weights[True], projections[True, True]
     m = 16
@@ -180,6 +198,7 @@ def test_capture_with_new_input_address(weights, projections):
     with torch.cuda.graph(graph):
         x = source * 1  # allocated by the capture
         projection(x, None, cache, slots, positions, table, q_out=q, og_out=og)
+    assert not replay_memcpys(graph)
     for seed in (8, 9):
         new_x, new_positions, new_slots = inputs(m, True, seed=seed)
         source.copy_(new_x)
@@ -191,3 +210,23 @@ def test_capture_with_new_input_address(weights, projections):
         torch.testing.assert_close(q, ref[:, :Q], atol=0, rtol=0)
         torch.testing.assert_close(og, ref[:, -Q:], atol=0, rtol=0)
         torch.testing.assert_close(cache, ref_cache, atol=0, rtol=0)
+
+
+def test_bind_does_not_leak_descriptors(weights, projections):
+    """Binding the projection once serves any number of captures: no capture or
+    replay stages or copies a descriptor, so nothing pinned accumulates."""
+    projection = projections[True, True]
+    m = 8
+    x, positions, slots = inputs(m, True, seed=11)
+    cache = kv_cache("HND")
+    table = rope_table()
+    q, og = (torch.empty(m, Q, dtype=torch.bfloat16, device="cuda") for _ in "qo")
+    args = (x, None, cache, slots, positions, table)
+    graphs = []
+    for _ in range(2):  # a second capture must not add host staging either
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            projection(*args, q_out=q, og_out=og)
+        graphs.append(graph)
+    for graph in graphs:
+        assert not replay_memcpys(graph)
