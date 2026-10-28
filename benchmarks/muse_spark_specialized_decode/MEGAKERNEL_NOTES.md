@@ -88,3 +88,23 @@ The 1.5-2x the user asked about is not available from kernels; it comes from
 deployment shape (two TP4 replicas: 2x aggregate at c=1) or from reading fewer
 bytes (the BF16 attention projections are 151 MB of the 554 MB per layer; FP8
 would cut ~75 MB and buy ~11 %, at an accuracy cost that needs an eval).
+
+## Where the 1.5-2x actually is: two replicas, measured
+
+One node, 8x B300, DFlash2, same prompts, 1024 output tokens.
+
+| deployment | c=1 per request | aggregate tok/s | c=16 aggregate |
+| --- | --- | --- | --- |
+| one TP8 replica | 1.72 ms TPOT, 558.6 tok/s | 558.6 | 3685 |
+| two TP4 replicas, executor on | 1.81 / 1.99 ms TPOT | **1020** (525.9 + 494.2) | 3527 (at 8 each) |
+
+Two TP4 replicas give **1.83x** the node's throughput of one TP8 replica at c=1
+with the same per-request latency, and are within 4 % at 16 concurrent requests.
+With stock TP4 the same comparison is 1.5x (2 x 419 = 838), so the executor is
+what makes the two-replica shape the better deployment: it buys 23 % more node
+throughput at c=1 than the same shape did before.
+
+The other lever is bytes: the BF16 attention projections (qkv 75.5 MB, o_proj
+33.5, pooler 16.8, unpooler 16.8) are 151 MB of the 554 MB a layer streams. FP8
+would halve them (-75 MB, ~14 us/layer, ~1.36x at c=1 from stock); NVFP4 would
+cut 113 MB (~21 us, ~1.44x). Both are accuracy decisions, not kernel work.
