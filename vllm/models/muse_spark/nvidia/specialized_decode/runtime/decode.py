@@ -89,6 +89,12 @@ class DecodeStep(NamedTuple):
 # Most rows of the published unpooler; above it the stock all-gather is as fast.
 UNPOOLER_MAX_ROWS = 128
 
+# The experts kernel took one 8-column tile width and a 16-pointer signature;
+# `tail/experts.py` still subclasses it with the previous shape, so the fused
+# tail waits for its rebind. Off, the layers run the plain expert kernel and
+# keep the stock finalize and unpooler: correct, just not fused.
+TAIL_BOUND = False
+
 
 @dataclass(slots=True)
 class PublishedBranch:
@@ -378,6 +384,8 @@ class SpecializedDecode:
         serves: NVFP4 layers whose FFN branch goes to the next boundary rather
         than to the draft model's aux hidden states."""
         if self.boundaries.unpooler is None:
+            return None
+        if not TAIL_BOUND:
             return None
         from ..tail.experts import PublishingRoutedExperts
         from ..tail.tail import MoeTail, layer_parities
