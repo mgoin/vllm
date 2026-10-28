@@ -31,9 +31,13 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
-# Rows of the largest step the executor runs: 32 requests verifying 8 tokens
-# each. Larger decode steps run the stock layers.
-MAX_ROWS = 256
+# Rows of the largest step the executor runs: 8 requests verifying 8 tokens
+# each. Above it the stock layers are at least as fast today: at 128 rows the
+# executor's own fused stages (all-reduce + dual norm, router, qkv) cost more
+# than the stock kernels they replace, and the end-to-end step is 2.3-2.8 %
+# slower (measured at concurrency 16, with and without adaptive verification).
+# Raise it only with a measurement that beats stock at 128 rows.
+MAX_ROWS = 64
 # The flashinfer-python that requirements/cuda.txt pins. The executor calls
 # FlashInfer's mnnvl_cutedsl internals and reads its attention metadata.
 FLASHINFER_VERSION = "0.7.2.post1"
