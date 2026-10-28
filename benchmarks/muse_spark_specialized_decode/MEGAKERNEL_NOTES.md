@@ -131,3 +131,25 @@ cut 113 MB (~21 us, ~1.44x). Both are accuracy decisions, not kernel work.
 
 Cross-session variance at 64 rows is ~4 % (314.4 us in one session, 328.0 in
 another, same code). Compare inside one `chg` job, never across sessions.
+
+## The router is at its topology limit too
+
+Isolated (1 GPU, 48 rotating weight copies past L2, graph replay, old and new
+alternated in one process): 6.21 us at 8 rows, 6.79 at 16, 10.25 at 64. The 8.4 MB
+weight stream alone is 2.00 us cold (4.4 TB/s), so of the 6.2 us at 8 rows:
+1.9 us stream + ~1.4 compute after the load + ~1.9 waiting for the last of 128
+per-row partials to become visible + ~1.0 for the top-8 in one warp.
+
+Every tiling alternative measured worse: PARTS=16 (256 CTAs) 11.0 us, PARTS=32
+15.7 us, 512 threads/CTA 6.90 us, arrival counters with an acq_rel handshake
+15.7 us, a relaxed arrival hint 6.5 us. The limit is the reduction topology (one
+row has 128 publishers), not the tiling, so going under ~4 us would need a
+cluster/DSMEM reduce across each group's 8 K-parts.
+
+The in-layer 14.7 us per call is PDL overlap and bandwidth sharing, not the
+kernel: its grid starts ~9 us before its dependency completes.
+
+The 8..128-row gate is validated: narrowing it to <=32 rows costs +19 us/layer at
+64 rows. FP32 input now stops at 32 rows, where the fused kernel still wins
+(6.68/7.99/10.16 us against the stock chain's 8.49/12.81/23.80); above that the
+stock chain is faster (14.28/22.77 against 11.68/13.19 at 64/128).
