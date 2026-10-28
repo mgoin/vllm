@@ -139,7 +139,14 @@ Per-layer forward, dummy weights, TP4, no EP, executor vs the stock numbers meas
 | --- | --- | --- | --- | --- | --- | --- |
 | stock us | 155.6 | 204.8 | 276.4 | 340.7 | 397.0 | 461.7 |
 | executor, old expert kernel + tail | 116.7 | 162.3 | 239.2 | 317.9 | 385.2 | 463.3 |
-| executor, new expert kernel, tail parked | 127.5 | 171.0 | 233.7 | 314.4 | stock (above MAX_ROWS) | stock |
+| executor, new expert kernel, tail parked | 127.5 | 171.0 | 233.7 | 314.4 | 397.6 | 459.4 |
+| executor, fused tail (one-shot <=16, owner-scatter above) | 122.4 | 165.1 | 240.4 | 317.9 | 385.9 | 463.4 |
+
+The fused tail is worth ~5 us/layer at 8/16 rows and is not resolvable at 32/64 (my runs put it
+3-7 us behind the no-tail path there, the tail agent's AUTOTUNE=1 runs put it 2 us ahead; the two
+schedules cost the same below 24 rows, so the end state is one owner-scatter schedule and no one-shot
+path at all). At 128 rows the executor is 11 us/layer *ahead* of stock, which is what the stage-off
+A/B predicted.
 
 The new expert kernel is a win at every row count it serves and improves 32/64 rows over the old one
 (239 -> 234, 318 -> 314). Parking the fused tail costs 11 us/layer at 8 rows, which is the size of the
