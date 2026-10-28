@@ -20,10 +20,8 @@ all-gather mailbox.
 The finalize scatters this rank's partial route rows to the token's owner, the
 owner finalizes the tokens it owns and multicasts their rows, and every rank
 copies the rest: each rank receives ``M * 54 KB`` per layer rather than the
-``M * 192 KB`` of a multicast-to-everyone schedule, which is what lets the tail
-pay from 8 to 64 rows. ``MAX_TOKENS`` is the routed experts' row range, so it
-is the largest step whose GEMM2 rows the experts can hand over; larger steps run
-the stock finalize and unpooler.
+``M * 192 KB`` of a multicast-to-everyone schedule. ``MAX_TOKENS`` is the range
+of steps where that pays; larger steps run the stock finalize and unpooler.
 
 Construction is collective over the TP group; ``precompile`` must run before
 CUDA graph capture. Every rank must call with the same rows; calls launch
@@ -41,7 +39,6 @@ from cutlass import BFloat16, Float32, Int32
 
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 
-from .. import MAX_EXPERT_ROWS
 from ..boundary.boundary import (
     AllGatherPublisher,
     LamportMailbox,
@@ -51,9 +48,13 @@ from ..boundary.boundary import (
 from ..boundary.publishing_gemm import gmem_ptr
 from .owned import CLUSTER, GENERATIONS, GRID, HIDDEN, TOP_K, OwnedFinalize
 
-# The routed experts serve this many rows (``EXPERTS_ROWS``), so it is the
-# largest step whose GEMM2 rows the tail can take.
-MAX_TOKENS = MAX_EXPERT_ROWS
+# Largest step the tail takes. Measured per layer at TP4 against the executor's
+# stock-finalize path (AUTOTUNE=0, two independent runs): -6.6/-5.1 us at 8 rows
+# and -4.3/-5.9 at 16, but inside the box's spread at 32 (-0.7 one way, +6.7 the
+# other) and at 64 (-9.7 one way, +3.5 the other), so it takes the steps where
+# it pays in both. Lift it (up to the routed experts' 64-row range) once a
+# 32/64-row win is established.
+MAX_TOKENS = 16
 
 
 def _stream() -> cuda.CUstream:

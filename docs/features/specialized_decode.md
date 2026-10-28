@@ -79,7 +79,7 @@ no-graphs deployment. It serves no requests, so it is not a serving mode.
 - **Some layers and stages.** BF16-expert layers, layers whose FFN feeds the
   draft model's auxiliary hidden states, decode steps above 128 rows for the
   attention/output boundary and the unpooler, routed experts above 64 rows
-  (`MAX_EXPERT_ROWS`), and the fused MoE tail above 64 rows all fall back to
+  (`MAX_EXPERT_ROWS`), and the fused MoE tail above 16 rows all fall back to
   their stock equivalents. Every fallback is decided from host state that all
   TP ranks share, so the ranks never disagree.
 - **Other attention backends, TP sizes, GPUs, MoE backends or a different
@@ -98,18 +98,18 @@ sum over the eight routes -- and publishes this rank's unpooler columns into the
 next boundary's all-gather in one chained launch, so the finalize, the
 unpooler GEMM and its publish cost one dependency chain rather than three.
 
-Which of its two schedules runs follows the row count, because the first hop
-moves `M * 8 * 4096` BF16 partial rows and that dominates from 24 rows on:
+The finalize scatters instead of broadcasting: every rank pushes its partial
+rows only to the token's owner (`t % tp`), the owner finalizes the tokens it
+owns and multicasts their BF16 rows, and every rank copies the rest. Each rank
+receives `M * 54 KB` per layer, against `M * 192 KB` for a
+multicast-to-everyone schedule, which is the floor for TP4. Per layer at TP4
+(B300, CUDA graph) the finalize is 8.7 us at 8 rows, 9.9 at 32 and 15.6 at 64,
+against 13.6, 12.8 and 18.7 for the stock finalize.
 
-| Rows | Schedule | What each rank receives |
-| --- | --- | --- |
-| up to 16 | one-shot: every rank multicasts its rows to every rank, and every rank finalizes every token | `M * 192 KB`, but no second hop |
-| above 16 | owner-scatter: ranks push their rows only to the token's owner (`t % tp`), the owner finalizes the tokens it owns and multicasts their BF16 rows, every rank copies the rest | `M * 54 KB` |
-
-Measured per layer at TP4 (B300, CUDA graph): the finalize is 8.7 us at 8 rows
-and 15.6 at 64, against 13.6 and 18.7 for the stock finalize; the whole chain
-(finalize, unpooler GEMM, all-gather consume) is 16.0 and 24.9 us against the
-executor's stock-finalize path's 22.0 and 28.3.
+It runs on the steps where it pays. Measured per layer against the executor's
+stock-finalize path, it is 4-7 us faster at 8 and 16 rows; at 32 and 64 rows
+the difference changes sign between runs (this box's spread), so those steps
+keep the stock finalize and unpooler (`MAX_TOKENS` in `tail/tail.py`, 16).
 
 ## Measured effect
 
