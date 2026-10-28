@@ -48,12 +48,13 @@ the argument:
 3. `moe/` — the router GEMM with top-k.
 4. `experts/` — the persistent NVFP4 routed experts (one 8-column tile kernel
    for every row count), bitwise equal to TRT-LLM-gen.
-5. `tail/` — the MoE tail: experts publishing their rows, the finalize, the
-   publishing unpooler.
+5. `tail/` — the MoE tail: the owner-scatter finalize (one schedule, 2-16 rows)
+   and the publishing unpooler.
 6. `runtime/` — the executor, its gates, the model state, warm-up, the L2
    prefetch.
 7. The model hooks: `get_model_state_cls`, `build_specialized_decode`, the
-   `plan()` call in `MuseSpark1xForCausalLM.forward`.
+   `plan()` call in `MuseSpark1xForCausalLM.forward`, and `MAX_ROWS` /
+   `MAX_EXPERT_ROWS` with the measurements behind them.
 
 Tests: `tests/models/muse_spark/nvidia/specialized_decode/` (config gate,
 five one-GPU kernel suites, two four-GPU numerics suites), wired into
