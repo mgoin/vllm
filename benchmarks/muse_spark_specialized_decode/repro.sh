@@ -36,8 +36,8 @@ for L in "$@"; do
   done
   if kill -0 $SP 2>/dev/null; then
     echo "[$L] ready after $(( $(date +%s) - t0 ))s"
-    for CN in ${CONCS:-"1 16" "4 32" "16 64"}; do
-      set -- $CN; C=$1; N=$2
+    for CN in ${CONCS:-1:16 2:16 4:32 8:48 16:64}; do
+      C=${CN%%:*}; N=${CN##*:}
       metrics > "$D/m_${L}_c${C}_before.txt"
       vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --port $PORT \
         --model $MODEL --dataset-name custom --dataset-path $DATA \

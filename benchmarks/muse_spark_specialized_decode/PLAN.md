@@ -107,6 +107,15 @@ boundary/attention code: at 8 rows 48 % is the expert stream and the remaining ~
 ten stages that are each within ~1.3x of their own roofline. The remaining c=1 levers are the expert
 kernel's stream rate, the router's 8.7 us, and the cross-rank wait inside the o_proj boundary.
 
+**Expert stream, measured with ncu (experts agent):** one expert is 7.08 MB — 6.29 MB of E2M1
+weights *plus 0.79 MB of E4M3 block scales* — so every roofline that used 6.29 MB understated the
+stream by 12 %. At 128 rows ncu counts 1.79 GB read against 1 798 MB computed from the routing: the
+reads are exactly once, no per-N-tile re-read, and the only duplication is the 1 % of experts that
+hold more than 8 tokens. The kernel moves that at 6.12 TB/s (6.45 under ncu-locked clocks) against
+stock's 6.79 TB/s for the same bytes; the residual 11 % is in-flight depth (128 KB per CTA with 8
+stages versus stock's 160 KB), proven by the stage sweep 3/4/8 = 5.33/5.70/5.93 TB/s, and request
+granularity is *not* the cause (CTA_K=512 is bit-exactly equal at equal in-flight bytes).
+
 **Bandwidth calibration (experts agent, nsys + ncu):** a pure streaming read on this box runs at
 5.5-5.8 TB/s (80 % of a 7.66 TB/s peak), and the stock TRT-LLM expert GEMMs reach 5.99 TB/s at 128
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
