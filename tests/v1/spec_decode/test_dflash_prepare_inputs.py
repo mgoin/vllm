@@ -220,3 +220,20 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_concat_columns_matches_cat_with_cast():
+    """The fused staging copy equals torch.cat, including the fp32 -> bf16 cast
+    of a target that keeps its residual stream in fp32."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import concat_columns
+
+    torch.manual_seed(0)
+    base = [torch.randn(12, 384, device="cuda") for _ in range(5)]
+    # Row slices of larger buffers, as the target's aux hidden states are.
+    inputs = [x[2:9] for x in base]
+    out = torch.empty(16, 5 * 384, device="cuda", dtype=torch.bfloat16)
+
+    concat_columns(inputs, out[:7])
+
+    torch.testing.assert_close(out[:7], torch.cat(inputs, dim=-1).bfloat16())

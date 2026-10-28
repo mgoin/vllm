@@ -486,7 +486,9 @@ class SpeculativeConfig:
     MTP). "fp8" uses per-row weight and per-token activation scales on the
     platform's FP8 linear kernel; "nvfp4" is weight-only on the platform's
     W4A16 kernel. The target verifies with its own head, so only the
-    acceptance length can change. Model Runner V2 only."""
+    acceptance length can change. For DFlash2 the copy only preselects
+    candidates, which are then rescored against the unquantized head. Model
+    Runner V2 only."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -1914,7 +1916,11 @@ class SpeculativeConfig:
 
         if self.draft_lm_head_quantization is not None:
             # Gemma-4 MTP scores tied embedding rows directly; no lm_head to share.
-            if self.method not in ("eagle", "eagle3", "mtp") or self.use_gemma4_mtp():
+            # DFlash supports it only for DFlash2 candidate preselection.
+            if (
+                self.method not in ("eagle", "eagle3", "mtp", "dflash")
+                or self.use_gemma4_mtp()
+            ):
                 raise ValueError(
                     "draft_lm_head_quantization is not supported for method "
                     f"{self.method!r}."

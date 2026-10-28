@@ -4,6 +4,7 @@
 from typing import Any
 
 import torch
+from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -215,6 +216,19 @@ class DFlash2Speculator(DFlashSpeculator):
         self.candidate_sampler = CandidateSampler(
             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
         )
+
+    def load_draft_model(
+        self,
+        target_model: nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> nn.Module:
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        # The candidate head may only be built once the LM head is shared.
+        if hasattr(model, "init_candidate_head"):
+            model.init_candidate_head()
+        if hasattr(model, "init_split_k_projections"):
+            model.init_split_k_projections()
+        return model
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # fp32 so the walk and the rejection that checks it read the same

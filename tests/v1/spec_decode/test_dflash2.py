@@ -352,6 +352,124 @@ def test_beam_draft_qk_norm_rope_cache(rows):
     torch.testing.assert_close(cache, expected_cache, rtol=0.01, atol=0.015625)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("rows", [7, 56])
+@pytest.mark.parametrize("preselect_quantization", [None, "fp8"])
+def test_candidate_head_matches_logits_processor_top_k(
+    monkeypatch, default_vllm_config, rows, preselect_quantization
+):
+    """The fused candidate head returns the BF16 head's top-k, scaled and soft
+    capped like the logits processor, with or without quantized preselection.
+
+    Candidate values must be the BF16 logits, so the walk and the rejection
+    sampler see the same distribution as without the preselection copy.
+    """
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.model_executor.models.qwen3_dflash2 import CandidateHead
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    # Online quantization reads the model dtype from the current config.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.fp8.get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    torch.manual_seed(0)
+    vocab, hidden, top_k = 5000, 512, 16
+    lm_head = ParallelLMHead(vocab, hidden, params_dtype=torch.bfloat16).cuda()
+    lm_head.weight.data.normal_(0, 0.02)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    processor = LogitsProcessor(vocab, scale=0.5, soft_cap=2.0)
+
+    expected_ids, expected_values = processor.get_top_k_tokens(
+        lm_head, hidden_states, top_k
+    )
+    head = CandidateHead(
+        lm_head, processor, top_k, preselect_quantization, preselect=4 * top_k
+    )
+    ids, values = head(hidden_states)
+
+    assert ids.dtype == expected_ids.dtype
+    assert values.dtype == expected_values.dtype == torch.float32
+    # BF16 logits tie, so compare values and check each id carries its logit.
+    torch.testing.assert_close(values, expected_values, rtol=1e-2, atol=1e-3)
+    # get_top_k_tokens scales before the soft cap.
+    logits = processor._get_logits(hidden_states, lm_head, None).float() * 0.5
+    logits = torch.tanh(logits / 2.0) * 2.0
+    torch.testing.assert_close(logits.gather(-1, ids), values, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_candidate_merge_kernels_match_full_vocab_top_k():
+    """Each rank's packed top-k, gathered rank-major, merges to the global
+    top-k with the scale and soft cap applied."""
+    from vllm.model_executor.models.qwen3_dflash2 import (
+        _local_top_k_kernel,
+        _merge_top_k_kernel,
+    )
+
+    torch.manual_seed(0)
+    tp_size, rows, shard, k, scale, soft_cap = 4, 5, 300, 16, 0.25, 20.0
+    # Distinct values, so the expected top-k is unambiguous.
+    logits = torch.randperm(rows * tp_size * shard, device="cuda").float()
+    logits = logits.view(rows, -1) / 100
+    packed = []
+    for rank, part in enumerate(logits.split(shard, dim=-1)):
+        values, ids = torch.topk(part, k)
+        out = torch.empty(rows, 2 * k, device="cuda")
+        _local_top_k_kernel[(rows,)](
+            values.contiguous(),
+            ids.contiguous(),
+            out,
+            rank * shard,
+            NUM_CANDIDATES=k,
+            TOP_K=k,
+            BLOCK=k,
+        )
+        packed.append(out)
+    ids = torch.empty(rows, k, dtype=torch.int64, device="cuda")
+    values = torch.empty(rows, k, device="cuda")
+    _merge_top_k_kernel[(rows,)](
+        torch.cat(packed),
+        ids,
+        values,
+        rows,
+        scale,
+        soft_cap,
+        TP_SIZE=tp_size,
+        TOP_K=k,
+        BLOCK=tp_size * k,
+        HAS_SOFT_CAP=True,
+    )
+
+    expected_values, expected_ids = torch.topk(logits, k)
+    expected_values = torch.tanh(expected_values * scale / soft_cap) * soft_cap
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(values, expected_values)
+
+    # Garbage rows (CUDA graph capture, padding) must still yield valid ids,
+    # which the selector uses to index its codebooks.
+    nan_values = torch.cat(packed)
+    nan_values.view(-1, 2, k)[:, 0] = float("nan")
+    ids.fill_(-1)
+    _merge_top_k_kernel[(rows,)](
+        nan_values,
+        ids,
+        values,
+        rows,
+        scale,
+        soft_cap,
+        TP_SIZE=tp_size,
+        TOP_K=k,
+        BLOCK=tp_size * k,
+        HAS_SOFT_CAP=True,
+    )
+    assert (ids >= 0).all()
+
+
 def _stub_base(monkeypatch, draft_logits):
     """A DFlashSpeculator.__init__ that allocates only what the base class would.
 

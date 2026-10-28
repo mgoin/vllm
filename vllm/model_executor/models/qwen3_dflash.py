@@ -15,19 +15,21 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
+from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -79,6 +81,21 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
+
+
+def tp_all_gather_rows(x: torch.Tensor) -> torch.Tensor:
+    """Gather ``[rows, n]`` from every TP rank into rank-major ``[tp * rows, n]``.
+
+    Prefers the custom (IPC/MNNVL) all-gather, a fraction of NCCL's latency
+    at drafter sizes, and falls back to the group all-gather.
+    """
+    group = get_tp_group()
+    communicator = group.device_communicator
+    if isinstance(communicator, CudaCommunicator):
+        gathered = communicator.custom_all_gather(x)
+        if gathered is not None:
+            return gathered
+    return group.all_gather(x, dim=0)
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -264,6 +281,12 @@ class DFlashQwen3Attention(nn.Module):
                     )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # One kernel for the per-head Q/K RMSNorm and RoPE.
+        self.fuse_qk_norm_rope = (
+            current_platform.is_cuda()
+            and self.head_dim in (64, 128, 256)
+            and type(self.rotary_emb) is RotaryEmbedding
+        )
 
     def forward(
         self,
@@ -275,6 +298,26 @@ class DFlashQwen3Attention(nn.Module):
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.fuse_qk_norm_rope and qkv.dtype == self.q_norm.weight.dtype:
+            ops.fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                positions,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.v_scale is not None:
+                v = v * self.v_scale
+            output, _ = self.o_proj(self.attn(q, k, v))
+            return output
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
@@ -474,7 +517,9 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
+            # Column-sharded: each rank reads 1/TP of the weight, and
+            # combine_hidden_states gathers the same outputs as a replicated GEMM.
+            self.fc = ColumnParallelLinear(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
                 ),
@@ -844,7 +889,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "do not exist in the target model (incompatible draft/target pair)."
             )
         # The target may keep its residual stream in FP32 (e.g. Muse Spark).
-        result = self.model.fc(hidden_states.to(self.model.fc.params_dtype))
+        fc = self.model.fc
+        result = fc(hidden_states.to(fc.params_dtype))
+        if fc.tp_size > 1:
+            result = tp_all_gather_rows(result).unflatten(0, (fc.tp_size, -1))
+            result = result.movedim(0, 1).flatten(1)
         if needs_squeeze:
             result = result.squeeze(0)
         return result
