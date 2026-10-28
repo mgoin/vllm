@@ -112,6 +112,20 @@ kernel's stream rate, the router's 8.7 us, and the cross-rank wait inside the o_
 rows. The 7.5 TB/s figure I used first was speculative; `roofline.py` now targets 6.0 TB/s. With that
 target the executor is at 3.67 TB/s (8 rows), 5.07 (32), 5.00 (64), 4.60 (128) of a 6.0 ceiling.
 
+## Integration state (experts kernel merged, fused tail parked, MAX_ROWS=64)
+
+Per-layer forward, dummy weights, TP4, no EP, executor vs the stock numbers measured the same way:
+
+| rows | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock us | 155.6 | 204.8 | 276.4 | 340.7 | 397.0 | 461.7 |
+| executor, old expert kernel + tail | 116.7 | 162.3 | 239.2 | 317.9 | 385.2 | 463.3 |
+| executor, new expert kernel, tail parked | 127.5 | 171.0 | 233.7 | 314.4 | stock (above MAX_ROWS) | stock |
+
+The new expert kernel is a win at every row count it serves and improves 32/64 rows over the old one
+(239 -> 234, 318 -> 314). Parking the fused tail costs 11 us/layer at 8 rows, which is the size of the
+prize for rebinding it. 128 rows and above run stock: parity by construction.
+
 ## Executor kernel profile (8 rows and 128 rows, 8-layer truncated model, TP4, no EP)
 
 Per forward of 8 layers, rank 0 (`vllm bench forward --profile-dir`):
