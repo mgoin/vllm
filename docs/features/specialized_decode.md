@@ -8,7 +8,7 @@ Blackwell. DeepSeek-V4.1 and Kimi-K3 have their own packages with the same
 `decode_backend` setting and their own deployment requirements.
 
 The executor runs only the decoder layers of a **pure decode or verify step
-captured into a FULL CUDA graph** of at most 256 rows. Prefill, mixed
+captured into a FULL CUDA graph** of at most 64 rows. Prefill, mixed
 prefill/decode, eager execution and PIECEWISE captures run the stock layers,
 which the package does not modify. Speculative decoding of any method
 (DFlash, DFlash2, DSpark) is supported, with or without adaptive verification;
@@ -71,7 +71,7 @@ no-graphs deployment. It serves no requests, so it is not a serving mode.
 
 - **Serving without CUDA graphs.** Use FULL decode graphs. An eager server is
   rejected at startup rather than silently running stock.
-- **Rows above 256**, or non-uniform (prefill) steps. Those forward passes run
+- **Rows above 64**, or non-uniform (prefill) steps. Those forward passes run
   the stock layers.
 - **FP8 (or other non-BF16) KV caches.** The fused QKV projection with the
   KV-cache insert is skipped and the stock projection and cache insert run
@@ -99,9 +99,16 @@ tokens/s across runs.
 
 | Concurrency | Stock step | Specialized step |
 | --- | --- | --- |
-| 1 | 10.07 ms | 7.83 ms (−22%) |
-| 4 | 14.19 ms | 11.71 ms (−17.5%) |
-| 16 | 20.12 ms | 20.98 ms (+4%) |
+| 1 | 9.52 ms | 8.02 ms (−16%) |
+| 4 | 13.40 ms | 11.20 ms (−16%) |
+| 16 | 20.17 ms | stock layers (see below) |
+
+At concurrency 16 a step verifies 128 rows, above the 64 rows the executor runs,
+so those steps use the stock layers and cost the same as stock. Above 64 rows the
+executor's own fused stages are slower than the kernels they replace — at 128
+rows its all-reduce and dual norm costs 77.9 us per layer against stock's 25.4,
+its router 48.2 against 12.8, and its fused QKV 28.2 against 9.5 — so the
+executor hands those steps back rather than losing to them.
 
 GSM8K is within noise of stock (0.959 stock, 0.958 specialized on 1319
 questions at concurrency 32).
@@ -116,7 +123,7 @@ B200 (SM100) is accepted by the deployment check but has not been measured.
 The startup log prints one line when the executor is enabled:
 
 ```text
-Muse Spark specialized decode on, for FULL-graph decode steps of up to 256 rows.
+Muse Spark specialized decode on, for FULL-graph decode steps of up to 64 rows.
 ```
 
 `vllm bench serve` against the same model with and without the setting shows

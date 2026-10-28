@@ -50,7 +50,7 @@ the executor's mailboxes and stage state, so the memory-profiling capture
 (against its throwaway KV cache) cannot leak into the real capture. For each
 forward the model asks the executor for a `DecodeStep`; only FULL graph
 captures of pure decode
-or verify steps of up to `MAX_ROWS` (256) rows get one, and the model then hands
+or verify steps of up to `MAX_ROWS` (64) rows get one, and the model then hands
 its embedding to the step. Every other forward runs the stock layers, which the
 executor does not modify.
 
