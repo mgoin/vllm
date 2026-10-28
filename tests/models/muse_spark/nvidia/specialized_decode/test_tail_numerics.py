@@ -3,11 +3,12 @@
 """Cross-rank numerics of the Muse Spark MoE tail at TP4.
 
 Each rank gets its own permuted GEMM2 buffer (its own row order, NaN padding,
-a missing route) of the same tokens. The tail (one-shot finalize + publishing
-unpooler GEMM, consumed by FlashInfer's unchanged all-gather dual norm) runs
-against the stock chain on identical inputs: FlashInfer's
-``tp_moe_finalize_rmsnorm``, ``torch.mm`` with the unpooler shard and
-FlashInfer's own all-gather publish. For M in 1, 2, 8, 16, 32 and 64 rows:
+a missing route) of the same tokens. The tail (one-shot finalize up to 16 rows,
+owner-scatter finalize above + publishing unpooler GEMM, consumed by
+FlashInfer's unchanged all-gather dual norm) runs against the stock chain on
+identical inputs: FlashInfer's ``tp_moe_finalize_rmsnorm``, ``torch.mm`` with
+the unpooler shard and FlashInfer's own all-gather publish. For M in 1, 2, 8,
+16, 32, 64 and 128 rows:
 
 * ``e`` against the stock finalize (bitwise fraction, max relative error);
 * the boundary outputs bitwise against the stock all-gather of the same ``e``
@@ -46,9 +47,9 @@ TP = 4
 HIDDEN = 4096
 BOUNDARY = 8192
 TOP_K = 8
-MAX_TOKENS = 64
-SIZES = (1, 2, 8, 16, 32, 64)
-GRAPH_SIZES = (1, 8, 16, 64)
+MAX_TOKENS = 128
+SIZES = (1, 2, 8, 16, 32, 64, 128)
+GRAPH_SIZES = (1, 16, 64, 128)
 REPLAYS = 1000
 LATE_CYCLES = 20_000
 EPS, POST_EPS, NEXT_EPS, GAIN = 1e-8, 1e-8, 1e-5, 1.0
@@ -276,6 +277,11 @@ def _check_replays(tail, gemm_for, workspace, model: Model, rank: int, replays: 
     armed = tail.box.buffer[:, peers].view(torch.int16) == -32768
     assert armed.all(), "peer slots not re-armed"
     generations = tail.finalize.generations
+    assert (generations == generations[0]).all()
+    assert tail.owned is not None
+    armed = tail.hop1.buffer[:, peers].view(torch.int16) == -32768
+    assert armed.all(), "hop-1 slots not re-armed"
+    generations = tail.owned.generations
     assert (generations == generations[0]).all()
     if rank == 0:
         print(
