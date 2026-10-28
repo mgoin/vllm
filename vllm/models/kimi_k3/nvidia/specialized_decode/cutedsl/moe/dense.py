@@ -9,9 +9,15 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import architecture, dynamic_fake, dynamic_view, stream
-from ..common.primitives import launch
-from ..gemm.projection import PreparedProjection
+from vllm.models.common.specialized_decode.host import (
+    architecture,
+    dynamic_fake,
+    dynamic_view,
+    stream,
+)
+from vllm.models.common.specialized_decode.primitives import launch
+from vllm.models.common.specialized_decode.projection import PreparedProjection
+
 from .shared import situ
 
 

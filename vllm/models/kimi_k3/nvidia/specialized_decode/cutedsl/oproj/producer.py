@@ -16,7 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Constexpr, Float32, Int64, Uint8, Uint32, Uint64
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     add_rn,
     alloc,
     at,
@@ -41,6 +41,7 @@ from ..common.primitives import (
     view,
     wait,
 )
+
 from ..common.twoshot import push
 
 

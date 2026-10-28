@@ -11,8 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
-from ..common.mailbox import poll, rearm
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     at,
     bf16,
@@ -28,6 +27,8 @@ from ..common.primitives import (
     wait,
     zeros,
 )
+
+from ..common.mailbox import poll, rearm
 
 
 @cute.jit

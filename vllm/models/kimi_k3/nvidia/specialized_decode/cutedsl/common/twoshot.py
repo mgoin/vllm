@@ -26,8 +26,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 
-from .mailbox import rearm
-from .primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     add_rn,
     at,
     load_vector,
@@ -38,6 +37,8 @@ from .primitives import (
     unpack_bf16,
     zeros,
 )
+
+from .mailbox import rearm
 
 SENTINEL = -0x80000000
 

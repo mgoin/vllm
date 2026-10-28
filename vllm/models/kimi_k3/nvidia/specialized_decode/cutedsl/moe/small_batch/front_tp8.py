@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
 
-from ...common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     bf16,
     copy_bulk,
@@ -41,6 +41,7 @@ from ...common.primitives import (
     warp_sum,
     zeros,
 )
+
 from ..routing import Top16Fast, bf16_word, gather_x, score_record, stage_rows
 
 

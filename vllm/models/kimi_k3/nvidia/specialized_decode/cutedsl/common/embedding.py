@@ -10,9 +10,11 @@ import torch
 from cutlass.cute.runtime import make_fake_stream
 
 from vllm.distributed import get_tp_group
-
-from .host import architecture, fake
-from .primitives import launch
+from vllm.models.common.specialized_decode.host import (
+    architecture,
+    fake,
+)
+from vllm.models.common.specialized_decode.primitives import launch
 
 
 class EmbeddingGather:

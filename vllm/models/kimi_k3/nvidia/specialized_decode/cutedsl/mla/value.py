@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Uint32
 
-from ..common.primitives import (
+from vllm.models.common.specialized_decode.primitives import (
     alloc,
     at,
     bf16x2,

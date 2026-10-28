@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import (
+from vllm.models.common.specialized_decode.host import (
     architecture,
     dynamic_fake,
     dynamic_view,
@@ -17,6 +17,7 @@ from ..common.host import (
     stream,
     to_cute,
 )
+
 from .kernel import ClusterAttnRes
 
 

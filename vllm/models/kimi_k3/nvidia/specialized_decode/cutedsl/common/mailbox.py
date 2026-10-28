@@ -7,7 +7,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Uint32
 
-from .primitives import load_words, published, store_relaxed
+from vllm.models.common.specialized_decode.primitives import (
+    load_words,
+    published,
+    store_relaxed,
+)
 
 SENTINEL = 0x80000000
 
