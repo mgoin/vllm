@@ -199,3 +199,18 @@ position on the critical path — it is that stock reads and writes more (split-
 reduce kernels, the permute/stage kernels, the separate qkv insert and its q
 copy). The layer is bound by its two weight streams: 403 MB of experts plus
 151 MB of BF16 dense weights, ~554 MB at ~5.5 TB/s.
+
+## A regression the acceptance run caught (and the revert)
+
+The router "split the weights under the PDL wait" refactor was reported
+bit-identical and timing-neutral, and it is neither: with it the engine
+equivalence test (`test_specialized_decode_matches_stock`, no adaptive
+verification) puts the relative difference after layer 0 at **0.51** against a
+0.02 threshold, so the router picks different experts. Splitting the weights into
+their three BF16 terms while the loads are still landing reads them before they
+arrive. Reverted; both parametrisations then pass with layer-0 at 6.0e-3 and
+5.5e-3 and an output median of 0.0.
+
+Full acceptance on the final tree, one reservation:
+`test_config_gate.py` 8 passed, the five kernel/numerics suites **166 passed**
+(3 min), `test_layers.py` **2 passed** (13 min, layer-0 max 6.0e-3 / 5.5e-3).
