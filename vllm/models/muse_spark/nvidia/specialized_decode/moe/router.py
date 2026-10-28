@@ -16,13 +16,13 @@ the same way) and each product of terms that matters is a BF16 MMA with FP32
 accumulation (``mma.sync.m16n8k16``), never TF32.
 
 128 CTAs of 256 threads: CTA (group g, part p) holds 16 experts' rows
-[16 g, 16 g + 16) x K eighth p (64 KB, in registers before the PDL wait, split
-into MMA fragments), stages the activation rows' K eighth in shared memory
+[16 g, 16 g + 16) x K eighth p (64 KB, in registers as its three BF16 terms
+before the PDL wait), stages the activation rows' K eighth in shared memory
 (double-buffered, 8 or 16 rows a pass) and sums its eight warps' K slices in a
 fixed order into its row of the partial-logits mailboxes. Warp w < 2 of CTA c
-then routes row 128 w + c: it polls the row's eight partials until no word holds the
-``SENTINEL``, adds them in part order, selects, writes and re-arms them. Every
-sum runs in a fixed order, so all ranks of a TP group get the same bits.
+then routes row 128 w + c: it polls the row's eight partials until no word holds
+the ``SENTINEL``, adds them in part order, selects, writes and re-arms them.
+Every sum runs in a fixed order, so all ranks of a TP group get the same bits.
 """
 
 import functools
@@ -210,17 +210,24 @@ class RouterKernel:
         staged = alloc(smem, Uint8, 2 * 2 * TILE * (CHUNK + 16) * 4, 128).iterator
         sums = alloc(smem, Float32, WARPS * GROUP * rows, 16).iterator
 
-        # The weights do not depend on the predecessor: into registers now.
-        # Lane (g, q) of warp v holds experts g and g + 8's K elements
-        # 16 s + 4 q + [0, 4) of the warp's K slice, for each step s.
+        # The weights do not depend on the predecessor: into registers now, and
+        # split into their three BF16 terms while the loads land, so the wait
+        # covers the split as well. Lane (g, q) of warp v holds experts g and
+        # g + 8's K elements 16 s + 4 q + [0, 4) of the warp's K slice.
         g, q = lane >> 2, lane & 3
         column = part * CHUNK + warp * WARP_K + 4 * q
         first = Int64((group * GROUP + g) * HIDDEN + column) * 4
         source = weight.iterator.toint() + first
-        w = []
+        terms = [[], [], []]
         for s in cutlass.range_constexpr(STEPS):
-            w.append(load_weights(source + s * 64))
-            w.append(load_weights(source + 8 * HIDDEN * 4 + s * 64))
+            top = load_weights(source + s * 64)
+            bottom = load_weights(source + 8 * HIDDEN * 4 + s * 64)
+            t01 = split3(top[0], top[1])
+            t23 = split3(top[2], top[3])
+            b01 = split3(bottom[0], bottom[1])
+            b23 = split3(bottom[2], bottom[3])
+            for i in cutlass.range_constexpr(3):
+                terms[i].append((t01[i], b01[i], t23[i], b23[i]))
         source = bias.iterator.toint() + lane * 32
         biases = list(load_weights(source)) + list(load_weights(source + 16))
         cute.arch.griddepcontrol_wait()
@@ -228,17 +235,6 @@ class RouterKernel:
 
         passes = (m + rows - 1) // rows
         self.stage(x, staged, m, part, 0)
-        # A fragments of the three terms: row g is expert g, row g + 8 is
-        # expert g + 8.
-        terms = [[], [], []]
-        for s in cutlass.range_constexpr(STEPS):
-            top, bottom = w[2 * s], w[2 * s + 1]
-            t01 = split3(top[0], top[1])
-            t23 = split3(top[2], top[3])
-            b01 = split3(bottom[0], bottom[1])
-            b23 = split3(bottom[2], bottom[3])
-            for i in cutlass.range_constexpr(3):
-                terms[i].append((t01[i], b01[i], t23[i], b23[i]))
         for c in cutlass.range(passes, unroll=1):
             if c + 1 < passes:  # the next rows load while these multiply
                 following = staged + (c + 1) % 2 * (rows * self.pitch)
