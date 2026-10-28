@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-GPU checks of the Muse Spark MoE tail's two finalize schedules, with
-their peers played by mailbox slots the test fills (the kernels store this
-rank's fragments into its own slot instead of multicasting them):
+"""Single-GPU checks of the Muse Spark MoE tail's owner-scatter finalize, with
+its peers played by mailbox slots the test fills (the kernel pushes into a
+scratch buffer for other owners and stores this rank's own plane itself):
 
 * the per-route math against a torch reference with the same roundings (FP32
   rank sum in rank order rounded to BF16, input-scaled RMSNorm, FP32 weighted
   route sum), for FP32 and BF16 routing weights, missing and out-of-range
   routes over NaN rows, negative zeros, and more tokens than clusters;
-* the one-shot schedule's published layout, the re-armed peer slots and the
-  generation counters across all three mailbox generations;
-* the owner-scatter schedule (``owned.py``): the hop-1 slots it consumes and
-  re-arms, the rows it multicasts (locally stored here), the rows it copies
-  out of the ``e`` plane of their owner, the plane it arms two generations
-  back, and the generation counters;
-* CUDA graph capture and replay of both.
+* the hop-1 slots it consumes and re-arms, the rows it multicasts (locally
+  stored here), the rows it copies out of the ``e`` plane of their owner, the
+  plane it arms two generations back, and the generation counters;
+* CUDA graph capture and replay.
 
 The cross-rank kernel is checked in ``test_tail_numerics.py``.
 
@@ -39,23 +36,6 @@ TOP_K = 8
 CAPACITY = 64
 EPS = 1e-8
 SENTINEL = -32768
-
-
-def _finalize(rank: int, published: bool = False):
-    from vllm.models.muse_spark.nvidia.specialized_decode.tail.tail import Finalize
-
-    mailbox = torch.full(
-        (3, TP, CAPACITY * TOP_K, HIDDEN), SENTINEL, dtype=torch.int16, device="cuda"
-    ).view(torch.bfloat16)
-    finalize = Finalize(
-        tp=TP,
-        rank=rank,
-        capacity=CAPACITY,
-        mailbox=mailbox,
-        multicast=0,
-        published=published,
-    )
-    return finalize, mailbox
 
 
 def _scrub(x: torch.Tensor) -> torch.Tensor:
@@ -104,15 +84,6 @@ def _reference(routes, weights, norm_weight, gain_center):
     return acc.bfloat16()
 
 
-def _fill_peers(mailbox, routes, generation: int, rank: int) -> None:
-    m = routes.shape[1]
-    for source in range(TP):
-        if source != rank:
-            mailbox[generation, source, : m * TOP_K] = _scrub(
-                routes[source].reshape(-1, HIDDEN)
-            )
-
-
 def _check(out, want, what: str) -> None:
     equal = (out.view(torch.int16) == want.view(torch.int16)).float().mean().item()
     rel = (
@@ -122,80 +93,6 @@ def _check(out, want, what: str) -> None:
     assert not out.isnan().any()
     assert equal > 0.99, what
     torch.testing.assert_close(out.float(), want.float(), rtol=1e-2, atol=1e-3)
-
-
-@pytest.mark.parametrize("published", [False, True])
-@pytest.mark.parametrize("fp32_weights", [True, False])
-@pytest.mark.parametrize("m", [1, 3, 8, 16, 40])
-def test_finalize_matches_reference(m: int, fp32_weights: bool, published: bool):
-    """Four launches cycle the mailbox generations (their own, or with
-    ``published`` rows the given layer parities); each one re-arms the peers'
-    slots it consumed and advances every CTA's generation."""
-    rank = 2
-    finalize, mailbox = _finalize(rank, published)
-    out = torch.empty(CAPACITY, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    for launch in range(4):
-        gain_center = float(launch % 2)
-        rows, idx, routes, weights, norm_weight = _inputs(
-            m, rank, fp32_weights, seed=launch
-        )
-        generation = (2, 0, 1, 2)[launch] if published else launch % 3
-        _fill_peers(mailbox, routes, generation, rank)
-        # Route (0, 3) has no expert (and no row): the experts publish none,
-        # so the finalize publishes its zero row itself.
-        ids = torch.zeros(m, TOP_K, dtype=torch.int32, device="cuda")
-        ids[0, 3] = -1
-        got = finalize(
-            rows,
-            idx,
-            weights,
-            norm_weight,
-            out,
-            eps=EPS,
-            gain_center=gain_center,
-            parity=generation,
-            topk_ids=ids if published else None,
-        )
-        torch.accelerator.synchronize()
-        _check(got, _reference(routes, weights, norm_weight, gain_center), f"M={m}")
-        if published:
-            assert not mailbox[generation, rank, 3].view(torch.int16).any()
-        else:
-            own = mailbox[generation, rank, : m * TOP_K].view(m, TOP_K, HIDDEN)
-            assert torch.equal(
-                own.view(torch.int16), _scrub(routes[rank]).view(torch.int16)
-            )
-        peers = [s for s in range(TP) if s != rank]
-        assert (mailbox[:, peers].view(torch.int16) == SENTINEL).all(), "re-arm"
-        assert (finalize.generations == launch + 1).all()
-
-
-def test_finalize_graph_replay():
-    rank = 0
-    m = 8
-    finalize, mailbox = _finalize(rank)
-    finalize.precompile()
-    out = torch.empty(CAPACITY, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    rows, idx, routes, weights, norm_weight = _inputs(m, rank, True, seed=0)
-    static = (rows, idx, weights)
-
-    def run():
-        return finalize(*static, norm_weight, out, eps=EPS, gain_center=1.0)
-
-    _fill_peers(mailbox, routes, 0, rank)
-    run()
-    torch.accelerator.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        got = run()
-    for replay in range(6):
-        rows, idx, routes, weights, _ = _inputs(m, rank, True, seed=replay + 1)
-        for dst, src in zip(static, (rows, idx, weights)):
-            dst.copy_(src)
-        _fill_peers(mailbox, routes, (replay + 1) % 3, rank)
-        graph.replay()
-        torch.accelerator.synchronize()
-        _check(got, _reference(routes, weights, norm_weight, 1.0), f"replay {replay}")
 
 
 OWNED_CAPACITY = 40
@@ -259,7 +156,7 @@ def _fill_owned(
 
 
 @pytest.mark.parametrize("fp32_weights", [True, False])
-@pytest.mark.parametrize("m", [17, 24, OWNED_CAPACITY])
+@pytest.mark.parametrize("m", [1, 8, 17, 24, OWNED_CAPACITY])
 def test_owned_matches_reference(m: int, fp32_weights: bool):
     """Three launches cycle the mailboxes: the owner finalizes the tokens it
     owns from the four ranks' rows, publishes them into every rank's ``e``

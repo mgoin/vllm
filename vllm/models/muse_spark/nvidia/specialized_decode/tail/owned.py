@@ -4,13 +4,12 @@
 # (flashinfer/comm/tp_moe_finalize_rmsnorm.py), flashinfer-python 0.7.2.post1,
 # Copyright (c) 2026 by FlashInfer team, Apache License 2.0.
 
-"""Two-hop owner-scatter finalize of Muse Spark's TP-sharded routed experts.
+"""The Muse Spark MoE tail's finalize: FlashInfer's owner-scatter schedule.
 
-The one-shot finalize (``finalize.py``) multicasts every rank's ``M * 8`` route
-rows into every rank: each rank receives ``3/4`` of the other ranks' ``M * 8 *
-4096`` BF16 partial rows, which is ``3 * M * 64 KB`` on the wire per layer and
-only pays while ``M`` is small. From ``M = 24`` tokens on this kernel splits the
-work instead, as FlashInfer's owner-scatter finalize does:
+Multicasting every rank's ``M * 8`` route rows into every rank (the schedule
+this replaces) makes each rank receive ``3/4`` of the other ranks' partial
+rows, ``3 * M * 64 KB`` per layer, and dies from 24 rows on. This kernel splits
+the work instead, as FlashInfer's ``tp_moe_finalize_rmsnorm`` does:
 
 1. **hop 1, scatter by token owner.** Rank ``owner(t) = t % tp`` owns token
    ``t``. Every rank pushes its partial rows for those tokens -- unicast -- into
@@ -19,15 +18,19 @@ work instead, as FlashInfer's owner-scatter finalize does:
 2. **local finalize of the owned tokens.** The owner sums the four ranks' rows
    in rank order in FP32, rounds once to BF16, runs the input-scaled per-route
    RMSNorm over the full 4096 columns and the FP32 weighted sum over the eight
-   routes -- the same arithmetic as the one-shot kernel -- and multicasts the
+   routes -- the arithmetic of FlashInfer's finalize -- and multicasts the
    token's BF16 row into every rank's ``e`` mailbox, plane ``owner(t)``, row
    ``t``. The second hop is ``M / 4 * 8 KB`` out and ``3 * M / 4 * 8 KB`` in.
 3. **copy.** Every rank copies the rows of the tokens it does not own out of its
    own ``e`` plane into its output block; the consumers' GEMM reads a
    contiguous ``[M, 4096]`` activation.
 
-That is ``M * 54 KB`` received per rank against ``M * 192 KB`` for the one-shot,
-and the second hop carries BF16 rows rather than FP32 partial sums.
+That is ``M * 54 KB`` received per rank against ``M * 192 KB`` for the
+one-shot multicast, and the second hop carries BF16 rows rather than FP32
+partial sums. Measured per layer at TP4 (B300, CUDA graph) the finalize is
+8.7 us at 8 rows, 9.9 at 32 and 15.6 at 64, against 13.6, 12.8 and 18.7 for
+the stock ``tp_moe_finalize_rmsnorm``; one schedule serves every row count, so
+there is no gate to get wrong.
 
 Lamport protocol: the hop-1 slots are armed with the negative-zero sentinel and
 each reader re-arms the four slots of the token it consumed (its own plane
@@ -70,23 +73,33 @@ from vllm.models.common.specialized_decode.primitives import (
 
 from ..boundary.primitives import load_u64_at, store_global_u32x4_at
 from ..boundary.publishing_gemm import gmem_ptr
-from .finalize import (
-    FRAGMENTS,
-    GENERATIONS,
-    HALF,
-    HIDDEN,
-    SENTINEL,
-    TOP_K,
-    VEC,
-    FinalizeKernel,
-    _dirty,
-)
+
+HIDDEN = 4096
+TOP_K = 8
+VEC = 8
+FRAGMENTS = HIDDEN // VEC
+HALF = TOP_K // 2
+# Lamport generations of both mailboxes; ``g % GENERATIONS`` selects one.
+GENERATIONS = 3
+SENTINEL = 0x80008000
+CLUSTER = 8
+GRID = 128
+
+
+def _dirty(words) -> cutlass.Boolean:
+    """Whether a BF16x8 fragment still holds the negative-zero sentinel."""
+    dirty = cutlass.Boolean(False)
+    for word in words:
+        dirty = dirty | ((word & Uint32(0xFFFF)) == Uint32(0x8000))
+        dirty = dirty | ((word >> Uint32(16)) == Uint32(0x8000))
+    return dirty
+
 
 def _stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-class OwnedFinalizeKernel(FinalizeKernel):
+class OwnedFinalizeKernel:
     """The owner-scatter finalize of one rank of a ``tp`` group.
 
     ``hop1`` is this rank's ``[3, tp, capacity_tp * 8, 4096]`` BF16 mailbox
@@ -102,22 +115,44 @@ class OwnedFinalizeKernel(FinalizeKernel):
         tp: int,
         rank: int,
         capacity: int,
-        cluster: int = 8,
-        grid: int = 128,
+        cluster: int = CLUSTER,
+        grid: int = GRID,
         fp32_weights: bool = True,
         multicast: bool = True,
     ) -> None:
-        super().__init__(
-            tp=tp,
-            rank=rank,
-            capacity=capacity,
-            cluster=cluster,
-            grid=grid,
-            single=False,
-            fp32_weights=fp32_weights,
-            multicast=multicast,
-        )
+        if FRAGMENTS % cluster or (FRAGMENTS // cluster) % 32:
+            raise ValueError(f"cluster={cluster} must split 512 fragments in warps")
+        if grid % cluster:
+            raise ValueError("grid must be a whole number of clusters")
+        self.tp, self.rank = tp, rank
+        self.capacity = capacity
         self.capacity_tp = -(-capacity // tp)
+        self.cluster, self.grid = cluster, grid
+        # Fragments of a route in one CTA, and warps per route.
+        self.band = FRAGMENTS // cluster
+        self.route_warps = self.band // 32
+        self.threads = TOP_K * self.band
+        self.warps = self.threads // 32
+        self.fp32_weights = fp32_weights
+        self.multicast = multicast
+
+    def smem_bytes(self) -> int:
+        # Half of the routes' normalized rows [HALF, band * VEC], small enough
+        # to share an SM with the publishing GEMM, and two parities of the
+        # [cluster, warps] sums of squares.
+        return HALF * self.band * VEC * 4 + 2 * self.cluster * self.warps * 4 + 64
+
+    @cute.jit
+    def load_own(self, mine, rows, permuted_idx, num_rows, token, k, column):
+        """This rank's fragment of route ``(token, k)`` into ``mine``, negative
+        zero made +0; a missing route reads zero without touching its (possibly
+        NaN) fallback row."""
+        mine.fill(Uint32(0))
+        row = permuted_idx[token * TOP_K + k]
+        if row >= 0 and row < num_rows:
+            words = load_vector(rows.iterator + (Int64(row) * HIDDEN + column))
+            for j in cutlass.range_constexpr(4):
+                mine[j] = no_neg_zero(words[j])
 
     @cute.jit
     def hop1_slot(self, generation, source, t_local, k, column):

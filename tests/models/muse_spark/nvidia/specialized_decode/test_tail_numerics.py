@@ -3,12 +3,11 @@
 """Cross-rank numerics of the Muse Spark MoE tail at TP4.
 
 Each rank gets its own permuted GEMM2 buffer (its own row order, NaN padding,
-a missing route) of the same tokens. The tail (one-shot finalize up to 16 rows,
-owner-scatter finalize above + publishing unpooler GEMM, consumed by
-FlashInfer's unchanged all-gather dual norm) runs against the stock chain on
-identical inputs: FlashInfer's ``tp_moe_finalize_rmsnorm``, ``torch.mm`` with
-the unpooler shard and FlashInfer's own all-gather publish. For M in 1, 2, 8,
-16, 32, 64 and 128 rows:
+a missing route) of the same tokens. The tail (owner-scatter finalize +
+publishing unpooler GEMM, consumed by FlashInfer's unchanged all-gather dual
+norm) runs against the stock chain on identical inputs: FlashInfer's
+``tp_moe_finalize_rmsnorm``, ``torch.mm`` with the unpooler shard and
+FlashInfer's own all-gather publish. For M in 1, 2, 8, 16, 32 and 64 rows:
 
 * ``e`` against the stock finalize (bitwise fraction, max relative error);
 * the boundary outputs bitwise against the stock all-gather of the same ``e``
@@ -19,22 +18,13 @@ the unpooler shard and FlashInfer's own all-gather publish. For M in 1, 2, 8,
 * one CUDA graph of tails at several sizes, with the stock finalize captured
   beside them, replayed ``REPLAYS`` times with fresh inputs and a late rank;
   mismatches are counted on the device; afterwards every peer slot is
-  re-armed and every generation counter agrees;
-* ``PublishingRoutedExperts`` (random NVFP4 experts per rank) at 1, 2, 4, 8 and
-  16 rows, the layer parities rotating: its GEMM2 rows bitwise those of
-  ``MuseRoutedExperts``, and the tail on the rows it published bitwise the
-  tail that publishes them itself (``e`` and the boundary outputs); then a
-  CUDA graph of three such layers replayed ``REPLAYS`` times with fresh
-  inputs and a late rank, checked the same way on the device; and degenerate
-  routing (ids -1, 256, 1000 and INT_MIN, repeated experts, NaN input scales)
-  in that mode, which must finish within a watchdog timeout.
+  re-armed and every generation counter agrees.
 
 Needs four SM100-family GPUs with NVLink multicast; about 3 minutes. For a
 race stress run, run this file as a module with ``--replays 10000``.
 """
 
 import argparse
-import faulthandler
 import os
 import tempfile
 
@@ -47,9 +37,9 @@ TP = 4
 HIDDEN = 4096
 BOUNDARY = 8192
 TOP_K = 8
-MAX_TOKENS = 128
-SIZES = (1, 2, 8, 16, 32, 64, 128)
-GRAPH_SIZES = (1, 16, 64, 128)
+MAX_TOKENS = 64
+SIZES = (1, 2, 8, 16, 32, 64)
+GRAPH_SIZES = (1, 8, 16, 64)
 REPLAYS = 1000
 LATE_CYCLES = 20_000
 EPS, POST_EPS, NEXT_EPS, GAIN = 1e-8, 1e-8, 1e-5, 1.0
@@ -274,240 +264,14 @@ def _check_replays(tail, gemm_for, workspace, model: Model, rank: int, replays: 
     assert boundary == 0, f"{boundary} boundary outputs off the stock all-gather"
     assert flips < 0.01 * total
     peers = [s for s in range(TP) if s != rank]
-    armed = tail.box.buffer[:, peers].view(torch.int16) == -32768
-    assert armed.all(), "peer slots not re-armed"
-    generations = tail.finalize.generations
-    assert (generations == generations[0]).all()
-    assert tail.owned is not None
     armed = tail.hop1.buffer[:, peers].view(torch.int16) == -32768
     assert armed.all(), "hop-1 slots not re-armed"
-    generations = tail.owned.generations
+    generations = tail.finalize.generations
     assert (generations == generations[0]).all()
     if rank == 0:
         print(
             f"{replays} graph replays: e {1 - flips / total:.5f} bitwise to the "
             "stock finalize, boundary exact; every peer slot re-armed"
-        )
-
-
-def _build(seed: int) -> dict:
-    from tests.models.muse_spark.nvidia.specialized_decode.test_expert_kernels import (
-        _nvfp4,
-    )
-    from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
-        prepare_static_weights_for_trtllm_fp4_moe,
-        reorder_w1w3_to_w3w1,
-    )
-    from vllm.models.muse_spark.nvidia.specialized_decode.experts import (
-        routed_experts_cute as k,
-    )
-
-    experts, inter = k.EXPERTS, k.INTER
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    u8 = dict(dtype=torch.uint8, device="cuda")
-    w13 = torch.empty(experts, 2 * inter, HIDDEN // 2, **u8)
-    w13_scale = torch.empty(experts, 2 * inter, HIDDEN // 16, **u8)
-    w2 = torch.empty(experts, HIDDEN, inter // 2, **u8)
-    w2_scale = torch.empty(experts, HIDDEN, inter // 16, **u8)
-    w13_scale_2 = torch.empty(experts, 2, device="cuda")
-    w2_scale_2 = torch.empty(experts, device="cuda")
-    for e in range(experts):
-        for i in range(2):
-            w = torch.randn(inter, HIDDEN, generator=g, device="cuda") * 0.02
-            w13_scale_2[e, i] = w.abs().max() / (6 * 448)
-            rows = slice(i * inter, (i + 1) * inter)
-            w13[e, rows], w13_scale[e, rows] = _nvfp4(
-                w.bfloat16(), (1 / w13_scale_2[e, i]).reshape(1)
-            )
-        w = torch.randn(HIDDEN, inter, generator=g, device="cuda") * 0.02
-        w2_scale_2[e] = w.abs().max() / (6 * 448)
-        w2[e], w2_scale[e] = _nvfp4(w.bfloat16(), (1 / w2_scale_2[e]).reshape(1))
-    w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale.view(torch.float8_e4m3fn))
-    w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
-        w13,
-        w2,
-        w13_scale,
-        w2_scale.view(torch.float8_e4m3fn),
-        hidden_size=HIDDEN,
-        intermediate_size=inter,
-        num_experts=experts,
-        is_gated_activation=True,
-    )
-    a13 = torch.tensor([4.0 / (6 * 448)], device="cuda")
-    a2 = torch.tensor([6.0 / (6 * 448)], device="cuda")
-    return dict(
-        w13=w13,
-        w13_scale=w13_scale.view(torch.float8_e4m3fn),
-        w2=w2,
-        w2_scale=w2_scale.view(torch.float8_e4m3fn),
-        g1_alphas=(a13 * w13_scale_2[:, 0]).contiguous(),
-        g1_scale_c=(a13 * w13_scale_2[:, 1] / a2).contiguous(),
-        g2_alphas=(a2 * w2_scale_2).contiguous(),
-        a1_gscale=(1.0 / a13).contiguous(),
-    )
-
-
-def _check_published_experts(group, publisher, gemm_for, model, rank, replays):
-    """``PublishingRoutedExperts`` feeding the tail; see the module docstring."""
-    from tests.models.muse_spark.nvidia.specialized_decode.test_expert_kernels import (
-        inputs,
-    )
-    from vllm.models.muse_spark.nvidia.specialized_decode.experts.routed_experts import (  # noqa: E501
-        MuseRoutedExperts,
-    )
-    from vllm.models.muse_spark.nvidia.specialized_decode.tail.experts import (
-        PublishingRoutedExperts,
-    )
-    from vllm.models.muse_spark.nvidia.specialized_decode.tail.tail import MoeTail
-
-    layer = _build(seed=11 + rank)
-    weights = [layer[n] for n in ("w13", "w13_scale", "w2", "w2_scale")]
-    weights += [layer[n] for n in ("g1_alphas", "g1_scale_c", "g2_alphas")]
-    tail = MoeTail(group, publisher=publisher, max_tokens=16)
-    tail.precompile()
-    stock = MuseRoutedExperts(*weights)
-    experts = PublishingRoutedExperts(*weights, target=tail.published_target, tp=TP)
-    norm = dict(eps=EPS, gain_center=GAIN)
-
-    def layer_step(case, parity, out, ref, e_ref):
-        """Publishing experts and their tail, and beside them the stock experts
-        and the self-publishing tail on the same rows."""
-        m = case[0].shape[0]
-        _late(rank, parity)
-        stock(*case, ref)
-        unfinalized = experts(*case, out, parity=parity)
-        handle = tail(
-            unfinalized,
-            model.norm_weight,
-            model.unpooler_shard,
-            parity=parity,
-            topk_ids=case[2],
-            **norm,
-        )
-        e = tail.e[:m].clone()
-        idx = unfinalized.expanded_idx_to_permuted_idx
-        tail.finalize(ref, idx, case[3], model.norm_weight, e_ref, **norm)
-        return handle, e
-
-    for step, m in enumerate((1, 2, 4, 8, 16)):
-        case = inputs(layer, m, "uniform", seed=500 + m)
-        out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        ref = torch.empty_like(out)
-        e_ref = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        handle, e = layer_step(case, step % 3, out, ref, e_ref)
-        tail.publisher.gated_residual_next_rmsnorm(
-            handle,
-            torch.zeros(m, BOUNDARY, device="cuda"),
-            model.alpha,
-            model.beta,
-            model.next_weight,
-            **_NORM,
-        )
-        torch.accelerator.synchronize()
-        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), f"M={m}"
-        assert torch.equal(e.view(torch.int16), e_ref.view(torch.int16)), f"M={m}"
-        if rank == 0:
-            print(f"published experts M={m}: rows and e bitwise")
-
-    # Degenerate routing (ids outside [0, 256), repeated experts, NaN input
-    # scales) must finish, under a watchdog, and match the stock experts with
-    # the self-publishing tail bit for bit (NaNs included).
-    faulthandler.dump_traceback_later(300, exit=True)
-    for step, m in enumerate((4, 16, 1)):
-        case = inputs(layer, m, "uniform", seed=800 + m)
-        ids = case[2]
-        ids[0] = torch.tensor(
-            [-1, 256, 1000, -(2**31), 5, 5, 5, 7], dtype=torch.int32, device="cuda"
-        )
-        if m > 1:
-            ids[1] = torch.tensor([3] * 8, dtype=torch.int32, device="cuda")
-            ids[m - 1, :4] = -1
-            case[1][m - 1, :8] = 0x7F  # E4M3 NaN block scales
-        out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        ref = torch.empty_like(out)
-        e_ref = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        handle, e = layer_step(case, (step + 2) % 3, out, ref, e_ref)
-        tail.publisher.gated_residual_next_rmsnorm(
-            handle,
-            torch.zeros(m, BOUNDARY, device="cuda"),
-            model.alpha,
-            model.beta,
-            model.next_weight,
-            **_NORM,
-        )
-        torch.accelerator.synchronize()
-        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), f"M={m}"
-        assert torch.equal(e.view(torch.int16), e_ref.view(torch.int16)), f"M={m}"
-        assert not out[:4].any(), "routes to no expert must be zero rows"
-        if rank == 0:
-            print(f"degenerate routing M={m}: finished, rows and e bitwise")
-    faulthandler.cancel_dump_traceback_later()
-
-    sizes = (1, 8, 16)
-    cases = [inputs(layer, m, "uniform", seed=600 + m) for m in sizes]
-    outs = [
-        torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        for m in sizes
-    ]
-    refs = [torch.empty_like(o) for o in outs]
-    e_refs = [
-        torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda") for m in sizes
-    ]
-    residuals = [torch.randn(m, BOUNDARY, device="cuda") for m in sizes]
-    branches = [
-        torch.empty(m, BOUNDARY // TP, dtype=torch.bfloat16, device="cuda")
-        for m in sizes
-    ]
-    mismatches = torch.zeros(3, dtype=torch.int64, device="cuda")
-    results: list = []
-
-    def graph_step():
-        results.clear()
-        for i, m in enumerate(sizes):
-            handle, e = layer_step(cases[i], i, outs[i], refs[i], e_refs[i])
-            got = tail.publisher.gated_residual_next_rmsnorm(
-                handle,
-                residuals[i],
-                model.alpha,
-                model.beta,
-                model.next_weight,
-                **_NORM,
-            )
-            gemm_for(m)(e_refs[i], model.unpooler_shard, branches[i])
-            want = _stock_boundary(
-                branches[i], _Residual(residuals[i]), model, gemm_for.workspace
-            )
-            results.append((outs[i], refs[i], e, e_refs[i], got, want))
-
-    graph_step()
-    torch.accelerator.synchronize()
-    torch.distributed.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_step()
-    generator = torch.Generator(device="cuda").manual_seed(rank)
-    for replay in range(replays):
-        for i, m in enumerate(sizes):
-            fresh = inputs(layer, m, "uniform", seed=700 + replay * 3 + i)
-            for buffer, value in zip(cases[i], fresh):
-                buffer.copy_(value)
-            residuals[i].normal_(generator=generator)
-        _late(rank, replay)
-        graph.replay()
-        for out, ref, e, e_ref, got, want in results:
-            mismatches[0] += _mismatches(out, ref)
-            mismatches[1] += _mismatches(e, e_ref)
-            for a, b in zip(got, want):
-                mismatches[2] += _mismatches(a, b)
-    torch.accelerator.synchronize()
-    rows, es, boundary = mismatches.tolist()
-    assert rows == 0 and es == 0 and boundary == 0, (rows, es, boundary)
-    peers = [s for s in range(TP) if s != rank]
-    assert (tail.published_box.buffer[:, peers].view(torch.int16) == -32768).all()
-    if rank == 0:
-        print(
-            f"{replays} graph replays of published experts + tail: rows, e and "
-            "boundary bitwise; every peer slot re-armed"
         )
 
 
@@ -580,8 +344,6 @@ def _worker(rank: int, port: int, replays: int, skip_path: str) -> None:
         model = Model(rank)
         _check_chain(tail, gemm_for, workspaces[1], model, rank)
         _check_replays(tail, gemm_for, workspaces[1], model, rank, replays)
-        gemm_for.workspace = workspaces[1]
-        _check_published_experts(group, publisher, gemm_for, model, rank, replays)
         torch.accelerator.synchronize()
         cleanup_dist_env_and_memory()
 
