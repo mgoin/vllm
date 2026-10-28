@@ -50,6 +50,7 @@ from ...model import (
     o_norm_sigmoid_gate,
 )
 from .. import MAX_EXPERT_ROWS, MAX_ROWS, DecodeConfig
+from ..tail.tail import ONESHOT_TOKENS
 from .linear import (
     O_PROJ_TACTICS,
     POOLER_TACTICS,
@@ -749,20 +750,32 @@ class SpecializedDecode:
             and isinstance(routing, tuple)
             and self.tail.supports(num_tokens)
         ):
-            parity = plan.tail_parity
-            unfinalized = plan.tail_experts(
-                a1q, a1q_scale, routing[0], routing[1], parity=parity
-            )
             post_norm = moe.post_expert_norm
             assert post_norm is not None
-            return self.tail(
-                unfinalized,
-                post_norm.weight,
-                plan.unpooler.weight,
+            norm_args = dict(
                 eps=post_norm.variance_epsilon,
                 gain_center=post_norm.fused_gain_center,
-                parity=parity,
-                topk_ids=routing[0],
+            )
+            if num_tokens <= ONESHOT_TOKENS:
+                parity = plan.tail_parity
+                unfinalized = plan.tail_experts(
+                    a1q, a1q_scale, routing[0], routing[1], parity=parity
+                )
+                return self.tail(
+                    unfinalized,
+                    post_norm.weight,
+                    plan.unpooler.weight,
+                    parity=parity,
+                    topk_ids=routing[0],
+                    **norm_args,
+                )
+            # The owner-scatter schedule publishes the rows itself, so the
+            # experts must not multicast them first: above the one-shot ceiling
+            # that would send every row twice.
+            assert plan.experts is not None
+            unfinalized = plan.experts(a1q, a1q_scale, routing[0], routing[1])
+            return self.tail(
+                unfinalized, post_norm.weight, plan.unpooler.weight, **norm_args
             )
         experts_out = self._experts(plan, a1q, a1q_scale, routing)
         if publish:
