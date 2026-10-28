@@ -47,11 +47,15 @@ def distinct_experts(rows: int) -> float:
 def per_layer_bytes(rows: int, ctx: int) -> float:
     """MB read per rank per layer."""
     mb = distinct_experts(rows) * expert_bytes()
-    # qkv (128 q + 16 kv + 16 kv + 128 gate heads of 64) NVFP4, per rank.
-    qkv = HIDDEN * ((128 + 16 + 16 + 128) * 64 // TP) * (NVFP4_BYTES + SCALES_PER_PARAM)
-    o_proj = 128 * 64 // TP * HIDDEN * (NVFP4_BYTES + SCALES_PER_PARAM)
+    # The checkpoint excludes `self_attn` from NVFP4, so the attention
+    # projections and the squeeze/expand matrices are BF16: 2 B per parameter,
+    # four times the NVFP4 expert stream for the same parameter count.
+    bf16 = 2.0
+    # qkv (128 q + 16 kv + 16 kv + 128 gate heads of 64), per rank.
+    qkv = HIDDEN * ((128 + 16 + 16 + 128) * 64 // TP) * bf16
+    o_proj = 128 * 64 // TP * HIDDEN * bf16
     # BF16 pooler + unpooler, column sharded.
-    squeeze = 2 * HIDDEN * (MOE_HIDDEN // TP) * 2
+    squeeze = 2 * HIDDEN * (MOE_HIDDEN // TP) * 2.0
     router = HIDDEN * NUM_EXPERTS * 4  # FP32, replicated
     dense = (qkv + o_proj + squeeze + router) / 1e6
     # KV reads: 46 sliding layers at 2048 tokens, 16 full layers at ctx, 16 kv
