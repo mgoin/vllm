@@ -37,6 +37,11 @@ logger = init_logger(__name__)
 # the end-to-end difference at concurrency 16 is inside this box's 3 %
 # run-to-run spread, so the executor keeps the throughput case.
 MAX_ROWS = 128
+# Rows whose routed experts the persistent kernel serves, and therefore the
+# largest step whose GEMM2 rows the publishing experts hand to the MoE tail.
+# The tail's published mailbox is sized by it, so it is one constant.
+MAX_EXPERT_ROWS = 64
+
 # The flashinfer-python that requirements/cuda.txt pins. The executor calls
 # FlashInfer's mnnvl_cutedsl internals and reads its attention metadata.
 FLASHINFER_VERSION = "0.7.2.post1"

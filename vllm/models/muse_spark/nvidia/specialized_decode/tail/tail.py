@@ -55,6 +55,7 @@ from ..boundary.boundary import (
 )
 from ..boundary.publishing_gemm import gmem_ptr
 from .finalize import GENERATIONS, HIDDEN, TOP_K, FinalizeKernel, compile_finalize
+from .. import MAX_EXPERT_ROWS
 from .owned import OwnedFinalize
 
 # Largest decode step the tail serves; the executor publishes up to
@@ -62,9 +63,10 @@ from .owned import OwnedFinalize
 # routed experts are the stock ones, so the tail publishes their rows itself
 # instead of starting at the poll.
 MAX_TOKENS = 128
-# Largest step whose GEMM2 rows the publishing experts multicast themselves
-# (``EXPERTS_ROWS``).
-PUBLISHED_TOKENS = 16
+# Largest step whose GEMM2 rows the publishing experts hand over themselves.
+# It is ``EXPERTS_ROWS.stop - 1``: the mailbox below is sized by it, and a
+# mismatch would overwrite a peer's rows rather than fail.
+PUBLISHED_TOKENS = MAX_EXPERT_ROWS
 CLUSTER = 8
 GRID = 128
 

@@ -49,7 +49,7 @@ from ...model import (
     norm_residual_then_norm,
     o_norm_sigmoid_gate,
 )
-from .. import MAX_ROWS, DecodeConfig
+from .. import MAX_EXPERT_ROWS, MAX_ROWS, DecodeConfig
 from .linear import (
     O_PROJ_TACTICS,
     POOLER_TACTICS,
@@ -89,11 +89,10 @@ class DecodeStep(NamedTuple):
 # Most rows of the published unpooler; above it the stock all-gather is as fast.
 UNPOOLER_MAX_ROWS = 128
 
-# The experts kernel took one 8-column tile width and a 16-pointer signature;
-# `tail/experts.py` still subclasses it with the previous shape, so the fused
-# tail waits for its rebind. Off, the layers run the plain expert kernel and
-# keep the stock finalize and unpooler: correct, just not fused.
-TAIL_BOUND = False
+# The fused tail, bound to the experts kernel's 8-column tile signature. Off,
+# the layers run the plain expert kernel and keep the stock finalize and
+# unpooler: correct, just not fused.
+TAIL_BOUND = True
 
 
 @dataclass(slots=True)
@@ -244,7 +243,7 @@ def fused_router(moe: MuseSpark1xMoE) -> "MuseRouter | None":
 # Rows of the persistent routed experts, which run one 8-column tile kernel for
 # every row count: 8 rows -15 %, 16 -17 %, 32 -13 %, 64 -4.5 %, 128 a wash on
 # B300. One row is slower than stock; the executor's smallest step is 8 anyway.
-EXPERTS_ROWS = range(2, 65)
+EXPERTS_ROWS = range(2, MAX_EXPERT_ROWS + 1)
 
 
 def routed_experts(moe: MuseSpark1xMoE) -> "MuseRoutedExperts | None":
@@ -399,7 +398,7 @@ class SpecializedDecode:
         if not served:
             return None
         group = get_tp_group().device_group
-        tail = MoeTail(group, publisher=self.boundaries.unpooler, max_tokens=16)
+        tail = MoeTail(group, publisher=self.boundaries.unpooler, max_tokens=MAX_EXPERT_ROWS)
         tail.precompile()
         parities = layer_parities(len(served))
         for i, parity in zip(served, parities):
