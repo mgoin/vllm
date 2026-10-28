@@ -241,9 +241,10 @@ def fused_router(moe: MuseSpark1xMoE) -> "MuseRouter | None":
     ).prepare(ROUTER_ROWS, dtypes=(torch.bfloat16,))
 
 
-# Rows of the persistent routed experts: faster than TRT-LLM-gen there; one
-# row and 32 rows of uniform routing are slower (B300).
-EXPERTS_ROWS = range(2, 17)
+# Rows of the persistent routed experts, which run one 8-column tile kernel for
+# every row count: 8 rows -15 %, 16 -17 %, 32 -13 %, 64 -4.5 %, 128 a wash on
+# B300. One row is slower than stock; the executor's smallest step is 8 anyway.
+EXPERTS_ROWS = range(2, 65)
 
 
 def routed_experts(moe: MuseSpark1xMoE) -> "MuseRoutedExperts | None":
