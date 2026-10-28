@@ -105,7 +105,9 @@ inline PTX/CuTe primitives. A model package must not import another model's
   kernels, with a late rank and many graph replays.
 - `test_layers.py` (four GPUs): a four-layer random-weight model through the
   engine with the DFlash2 draft, `latency_specialized` against `auto`, with and
-  without adaptive verification.
+  without adaptive verification. It needs the repository conftest (`vllm_runner`)
+  and the Muse Spark configs, so it is not in CI; it passes on B300 with the
+  checkpoint cache warm (2 passed, 12 min).
 
 The startup-gate test, the five kernel tests and the two numerics tests run in
 the nightly `muse-spark-specialized-decode-4xb200` Buildkite job (B200, four
