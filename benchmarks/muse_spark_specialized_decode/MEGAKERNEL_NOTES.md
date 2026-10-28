@@ -108,3 +108,26 @@ The other lever is bytes: the BF16 attention projections (qkv 75.5 MB, o_proj
 33.5, pooler 16.8, unpooler 16.8) are 151 MB of the 554 MB a layer streams. FP8
 would halve them (-75 MB, ~14 us/layer, ~1.36x at c=1 from stock); NVFP4 would
 cut 113 MB (~21 us, ~1.44x). Both are accuracy decisions, not kernel work.
+
+## Landed this round, with the A/B that justified it
+
+- **FP32 router input on the fused kernel** (`[Muse] Router: run the FP32 router
+  input on the fused kernel`): at 32 < rows <= 128 the executor used to fall back
+  to the stock TF32 GEMM + Triton routing while still paying to produce the FP32
+  input. Back-to-back A/B, same session: 8 rows 122.9 vs 123.8 us/layer, 32 rows
+  241.9 vs 241.6, 64 rows 328.3 vs 327.7 — neutral, so the change is kept for the
+  consistency, not for speed. 19 router tests pass, 6 of them new.
+- **Cold-cache publish-GEMM sweep** (`bench_publish.py`) and its result: the eight-row
+  tactics in `TACTICS` are already the best of ~50 measured configurations; the
+  three kernels run at 4.0-4.7 TB/s isolated, which is the layer average (4.45),
+  so there is nothing concentrated to fix there.
+- **An A/B of the fused QKV's K-split** (PARTS 4 -> 8, doubling the CTAs): 0.2 us
+  at 8 rows, i.e. nothing.
+- **An A/B of the L2 prefetch**: 122.9 vs 123.1 us/layer at 8 rows and 240.4 vs
+  240.9 at 32 rows — neutral, so it neither helps nor hurts and is a candidate for
+  deletion on simplicity grounds, not performance grounds.
+
+## Calibration warning for anyone reusing these numbers
+
+Cross-session variance at 64 rows is ~4 % (314.4 us in one session, 328.0 in
+another, same code). Compare inside one `chg` job, never across sessions.
