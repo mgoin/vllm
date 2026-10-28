@@ -31,12 +31,13 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
-# Rows of the largest step the executor runs: 16 requests verifying 8 tokens
-# each. A stage-off A/B in the harness puts every executor stage ahead of the
-# stock kernels at 128 rows too (11.8 us/layer better over the whole forward);
-# the end-to-end difference at concurrency 16 is inside this box's 3 %
-# run-to-run spread, so the executor keeps the throughput case.
-MAX_ROWS = 128
+# Rows of the largest step the executor runs: 8 requests verifying 8 tokens
+# each. Three paired server runs put the end-to-end step at concurrency 16
+# (128 rows) 3.4 % *behind* stock every time (20.09/20.29/20.44 ms stock against
+# 20.88/20.98/21.06 ms), even though the executor's forward at 128 rows measures
+# 11 us/layer faster in the harness: the 3 % is outside the forward, and until
+# it is found the executor keeps the range where it wins end to end.
+MAX_ROWS = 64
 # Rows whose routed experts the persistent kernel serves, and therefore the
 # largest step whose GEMM2 rows the publishing experts hand to the MoE tail.
 # The tail's published mailbox is sized by it, so it is one constant.
