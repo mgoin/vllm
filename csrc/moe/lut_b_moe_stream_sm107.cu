@@ -145,12 +145,25 @@ __device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
 
 __device__ __forceinline__ void bulk_copy(void* dst, void const* src,
                                           int bytes, uint64_t* bar,
-                                          uint64_t policy) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes."
-      "L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(smem_addr(dst)),
-      "l"(src), "r"(bytes), "r"(smem_addr(bar)), "l"(policy)
-      : "memory");
+                                          uint64_t policy, bool hint) {
+  if (hint)
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes."
+        "L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(smem_addr(dst)),
+        "l"(src), "r"(bytes), "r"(smem_addr(bar)), "l"(policy)
+        : "memory");
+  else
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        "[%0], [%1], %2, [%3];" ::"r"(smem_addr(dst)),
+        "l"(src), "r"(bytes), "r"(smem_addr(bar))
+        : "memory");
+}
+
+__device__ __forceinline__ void prefetch_l2(void const* src, int bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src),
+               "r"(bytes)
+               : "memory");
 }
 
 __device__ __forceinline__ void mbar_init(uint64_t* bar, int count) {
@@ -288,10 +301,12 @@ struct Params {
   int N;
   int K;
   int splits;
+  int prefetch;  // K steps of weights to prefetch into L2 ahead of the ring
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
   // wrong: 1 copies TMEM metadata only on an item's first K step, 2 skips
   // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
-  // skips the epilogue's TMEM loads and stores.
+  // skips the epilogue's TMEM loads and stores, 32 copies only the packed
+  // indices, 64 drops the L2 evict_first hint on weight loads.
   int debug;
 };
 
@@ -312,6 +327,58 @@ __device__ __forceinline__ Item decode_item(int i, int n_tiles, int splits,
   it.k_end = (it.split + 1) * k_tiles / splits;
   return it;
 }
+
+// Walks this CTA's (item, K step) sequence for the weight producer, skipping
+// items whose expert is not local.
+struct Cursor {
+  int32_t const* expert_ids;
+  uint8_t const* b;
+  int tiles_n, splits, i, num_items, n_tiles, k_tiles, k, k_end;
+  uint8_t const* b0;
+
+  __device__ Cursor(Params const& p, int num_items_, int n_tiles_,
+                    int k_tiles_)
+      : expert_ids(p.expert_ids),
+        b(p.b),
+        tiles_n(p.N / kTileN),
+        splits(p.splits),
+        i(int(blockIdx.x) - int(gridDim.x)),
+        num_items(num_items_),
+        n_tiles(n_tiles_),
+        k_tiles(k_tiles_),
+        k(0),
+        k_end(0),
+        b0(nullptr) {
+    next_item();
+  }
+
+  __device__ void next_item() {
+    for (i += gridDim.x; i < num_items; i += gridDim.x) {
+      Item const it = decode_item(i, n_tiles, splits, k_tiles);
+      int const expert = expert_ids[it.m_block];
+      if (expert < 0) continue;
+      b0 = b + (int64_t(expert) * tiles_n + 2 * it.n_tile) * k_tiles *
+                   kTileBytes;
+      k = it.k_begin;
+      k_end = it.k_end;
+      if (k < k_end) return;
+    }
+  }
+  __device__ bool valid() const { return i < num_items; }
+  __device__ void advance() {
+    if (++k >= k_end) next_item();
+  }
+  __device__ uint8_t const* tile0() const {
+    return b0 + int64_t(k) * kTileBytes;
+  }
+  __device__ uint8_t const* tile1() const {
+    return b0 + int64_t(k_tiles + k) * kTileBytes;
+  }
+  __device__ void prefetch() const {
+    prefetch_l2(tile0(), kTileBytes);
+    prefetch_l2(tile1(), kTileBytes);
+  }
+};
 
 template <typename OutT, int kAGroups>
 __global__ void __launch_bounds__(kThreads, 1)
@@ -368,35 +435,42 @@ __global__ void __launch_bounds__(kThreads, 1)
       uint64_t policy;
       asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
                    : "=l"(policy));
-      int step = 0;
-      for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-        Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-        int const expert = p.expert_ids[it.m_block];
-        if (expert < 0) continue;
-        uint8_t const* b0 = p.b + (int64_t(expert) * (p.N / kTileN) +
-                                   2 * it.n_tile) *
-                                      k_tiles * kTileBytes;
-        uint8_t const* b1 = b0 + int64_t(k_tiles) * kTileBytes;
-        for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
-          int const stage = step % kStages;
-          mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
-          uint8_t* st = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
-          uint64_t* bar = &full_bar[stage];
-          mbar_arrive_expect_tx(bar, kExpectTxBytes);
-          uint8_t const* t0 = b0 + int64_t(k) * kTileBytes;
-          uint8_t const* t1 = b1 + int64_t(k) * kTileBytes;
-          bulk_copy(st + kBIdxOff, t0, kTileIdxBytes, bar, policy);
-          bulk_copy(st + kBIdxOff + kTileIdxBytes, t1, kTileIdxBytes, bar,
-                    policy);
+      bool const hint = !(p.debug & 64);
+      bool const books = !(p.debug & 32);
+      // A second cursor runs `prefetch` K steps ahead and pulls those weight
+      // tiles into L2, so the shared-memory ring refills from L2 instead of
+      // waiting a full HBM round trip per stage.
+      Cursor load(p, num_items, n_tiles, k_tiles);
+      Cursor ahead = load;
+      for (int d = 0; d < p.prefetch && ahead.valid(); ++d) {
+        ahead.prefetch();
+        ahead.advance();
+      }
+      for (int step = 0; load.valid(); ++step, load.advance()) {
+        if (ahead.valid()) {
+          ahead.prefetch();
+          ahead.advance();
+        }
+        int const stage = step % kStages;
+        mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+        uint8_t* st = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
+        uint64_t* bar = &full_bar[stage];
+        mbar_arrive_expect_tx(bar, books ? kExpectTxBytes : 2 * kTileIdxBytes);
+        uint8_t const* t0 = load.tile0();
+        uint8_t const* t1 = load.tile1();
+        bulk_copy(st + kBIdxOff, t0, kTileIdxBytes, bar, policy, hint);
+        bulk_copy(st + kBIdxOff + kTileIdxBytes, t1, kTileIdxBytes, bar,
+                  policy, hint);
+        if (books) {
           bulk_copy(st + kBScaleOff, t0 + kTileIdxBytes, kTileScaleBytes, bar,
-                    policy);
+                    policy, hint);
           bulk_copy(st + kBScaleOff + kTileScaleBytes, t1 + kTileIdxBytes,
-                    kTileScaleBytes, bar, policy);
+                    kTileScaleBytes, bar, policy, hint);
           bulk_copy(st + kBBookOff, t0 + kTileIdxBytes + kTileScaleBytes,
-                    kTileBookBytes, bar, policy);
+                    kTileBookBytes, bar, policy, hint);
           bulk_copy(st + kBBookOff + kTileBookBytes,
                     t1 + kTileIdxBytes + kTileScaleBytes, kTileBookBytes, bar,
-                    policy);
+                    policy, hint);
         }
       }
     }
@@ -740,6 +814,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.splits = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
+  char const* prefetch_env = std::getenv("VLLM_LUT_B_STREAM_PREFETCH");
+  params.prefetch = prefetch_env ? std::atoi(prefetch_env) : 16;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
