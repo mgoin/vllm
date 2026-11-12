@@ -101,12 +101,15 @@ struct Config {
   static_assert(kStages >= 4);
 };
 
-// TMEM: 256 accumulator columns, then A scales, B scales (N256 = 8 columns)
-// and codebooks.
+// TMEM: 256 accumulator columns, then one 16-column metadata slot per stage:
+// A scales (4 columns), B scales (N256 = 8 columns), codebooks (4 columns).
+// The epilogue warps fill the slots with tcgen05.st, which keeps tcgen05.cp
+// off the MMA issue path (serialized copies cost 10-15% of the step).
 constexpr int kTmemCols = 512;
-constexpr int kTmemAScale = kBlockN;
-constexpr int kTmemBScale = kBlockN + 4;
-constexpr int kTmemBook = kBlockN + 12;
+constexpr int kMetaCols = 16;
+constexpr int kMetaAScale = 0;
+constexpr int kMetaBScale = 4;
+constexpr int kMetaBook = 12;
 
 constexpr int kMaxSplits = 16;
 
@@ -247,6 +250,18 @@ __device__ __forceinline__ void tmem_ld32(uint32_t addr, uint32_t (&v)[32]) {
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
+__device__ __forceinline__ void tmem_st16(uint32_t addr, uint4 const (&v)[4]) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,"
+      "%9,%10,%11,%12,%13,%14,%15,%16};" ::"r"(addr),
+      "r"(v[0].x), "r"(v[0].y), "r"(v[0].z), "r"(v[0].w), "r"(v[1].x),
+      "r"(v[1].y), "r"(v[1].z), "r"(v[1].w), "r"(v[2].x), "r"(v[2].y),
+      "r"(v[2].z), "r"(v[2].w), "r"(v[3].x), "r"(v[3].y), "r"(v[3].z),
+      "r"(v[3].w)
+      : "memory");
+  asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+}
+
 __device__ __forceinline__ void epilogue_bar() {
   asm volatile("bar.sync 1, %0;" ::"n"(kEpilogueThreads) : "memory");
 }
@@ -289,7 +304,7 @@ struct Params {
   int K;
   int splits;
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
-  // wrong: 1 copies TMEM metadata only on an item's first K step, 2 skips
+  // wrong: 2 skips
   // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
   // skips the epilogue's TMEM loads and stores.
   int debug;
@@ -318,12 +333,14 @@ __global__ void __launch_bounds__(kThreads, 1)
     lut_b_moe_stream_kernel(Params const p) {
   using Cfg = Config<kAGroups>;
   constexpr int kStages = Cfg::kStages;
+  static_assert(kBlockN + kStages * kMetaCols <= kTmemCols);
 
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   __shared__ __align__(8) uint64_t full_bar[kStages];
   __shared__ __align__(8) uint64_t empty_bar[kStages];
+  __shared__ __align__(8) uint64_t meta_bar[kStages];
   __shared__ __align__(8) uint64_t acc_full_bar;
   __shared__ __align__(8) uint64_t acc_empty_bar;
   __shared__ uint32_t tmem_base;
@@ -345,6 +362,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       // One expect_tx arrival plus one cp.async arrival per A-loader lane.
       mbar_init(&full_bar[s], 1 + 32);
       mbar_init(&empty_bar[s], 1);
+      mbar_init(&meta_bar[s], kEpilogueThreads);
     }
     mbar_init(&acc_full_bar, 1);
     mbar_init(&acc_empty_bar, kEpilogueThreads);
@@ -443,7 +461,9 @@ __global__ void __launch_bounds__(kThreads, 1)
         tc_fence_after();
         for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
           int const stage = step % kStages;
-          mbar_wait(&full_bar[stage], (step / kStages) & 1);
+          // The metadata slot is filled after the stage lands, so this also
+          // waits for the stage.
+          mbar_wait(&meta_bar[stage], (step / kStages) & 1);
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -451,13 +471,7 @@ __global__ void __launch_bounds__(kThreads, 1)
           uint8_t* b_st = st + Cfg::kBOff;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          if (!(p.debug & 1) || k == it.k_begin) {
-            copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
-            copy_meta(tmem + kTmemBScale, b_st + kBScaleOff);
-            copy_meta(tmem + kTmemBScale + 4,
-                      b_st + kBScaleOff + kTileScaleBytes);
-            copy_meta(tmem + kTmemBook, b_st + kBBookOff);
-          }
+          uint32_t const meta = tmem + kBlockN + stage * kMetaCols;
           uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
           uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
           // Compressed B rows are 48 bytes; descriptor bit 53 selects the
@@ -465,11 +479,11 @@ __global__ void __launch_bounds__(kThreads, 1)
           uint64_t const b_lo = smem_desc(b_st + kBIdxOff, 128, 384);
           uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
           if (!(p.debug & 4)) {
-            mma_lut_fill(tmem, a_lo, b_lo, tmem + kTmemBook, idesc,
-                         tmem + kTmemAScale, tmem + kTmemBScale,
+            mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
+                         meta + kMetaAScale, meta + kMetaBScale,
                          k != it.k_begin);
-            mma_lut_lastuse(tmem, a_hi, b_hi, tmem + kTmemBook + 2, idesc_hi,
-                            tmem + kTmemAScale, tmem + kTmemBScale);
+            mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
+                            meta + kMetaAScale, meta + kMetaBScale);
           }
           tc_commit(&empty_bar[stage]);
         }
@@ -484,7 +498,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int const row = quarter * 32 + lane;
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
-    int local = 0;
+    int local = 0, step = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
       int32_t const sid = row < kRows
@@ -501,6 +515,25 @@ __global__ void __launch_bounds__(kThreads, 1)
             dst[j] = make_uint4(0, 0, 0, 0);
         }
         continue;
+      }
+
+      // Fill each stage's TMEM metadata slot as it lands. Every warp writes
+      // its lane quarter, which gives the replication across all four
+      // quarters that tcgen05.cp.32x128b.warpx4 would.
+      for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
+        int const stage = step % kStages;
+        mbar_wait(&full_bar[stage], (step / kStages) & 1);
+        uint8_t const* st = smem + stage * Cfg::kStageBytes;
+        uint8_t const* b_st = st + Cfg::kBOff;
+        uint4 v[4];
+        v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff)[lane];
+        v[1] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff)[lane];
+        v[2] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff +
+                                              kTileScaleBytes)[lane];
+        v[3] = reinterpret_cast<uint4 const*>(b_st + kBBookOff)[lane];
+        tmem_st16(lane_addr + kBlockN + stage * kMetaCols, v);
+        tc_fence_before();
+        mbar_arrive(&meta_bar[stage]);
       }
 
       float const w = (p.topk_weights != nullptr && valid)
