@@ -321,9 +321,12 @@ struct Params {
   // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
   // activation loads, 16 skips the epilogue's TMEM loads and stores, 32
   // issues every MMA pair twice, 64 drops the per-step fence.proxy.async.
+  // 128 / 256 batch the per-stage empty commits by 2 / 4 (results stay
+  // correct).
   int debug;
-  // EXPERIMENT (VLLM_LUT_B_STREAM_META): 1 metadata by tcgen05.st from the
-  // metadata warps (default), 0 by tcgen05.cp from the MMA thread.
+  // EXPERIMENT (VLLM_LUT_B_STREAM_META): metadata by 0 tcgen05.cp from the
+  // MMA thread, 1 tcgen05.st from the metadata warps (default), 2 tcgen05.st
+  // from the epilogue warps before each item (launches without warps 7-10).
   int meta_st;
   // TEMPORARY (VLLM_LUT_B_STREAM_TRACE): kTraceSlots timestamps per CTA.
   long long* trace;
@@ -364,6 +367,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   __shared__ __align__(8) uint64_t meta_bar[kStages];
   __shared__ __align__(8) uint64_t acc_full_bar;
   __shared__ __align__(8) uint64_t acc_empty_bar;
+  __shared__ __align__(8) uint64_t epi_done_bar;
   __shared__ uint32_t tmem_base;
   __shared__ int last_split;
   __shared__ int32_t epi_sid[kBlockM];
@@ -391,6 +395,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
     mbar_init(&acc_full_bar, 1);
     mbar_init(&acc_empty_bar, kEpilogueThreads);
+    mbar_init(&epi_done_bar, kEpilogueThreads);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   if (warp == kMmaWarp) {
@@ -493,6 +498,8 @@ __global__ void __launch_bounds__(kThreads, 1)
                              (uint32_t(kBlockM / 16) << 24) | (1u << 31);
       // The second K64 half uses scale byte 2 of each 4-byte A/B scale word.
       uint32_t const idesc_hi = idesc | (2u << 29) | (2u << 4);
+      int const commit_group = (p.debug & 256) ? 4 : (p.debug & 128) ? 2 : 1;
+      int pending = 0;
       int step = 0, local = 0;
       long long t_first = 0, t_last = 0, t_commit = 0, c_full = 0, c_acc = 0;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
@@ -527,7 +534,7 @@ __global__ void __launch_bounds__(kThreads, 1)
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
           uint32_t const meta = tmem + kBlockN + stage * kMetaCols;
-          if (!p.meta_st) {
+          if (p.meta_st == 0) {
             copy_meta(meta + kMetaAScale, st + Cfg::kAScaleOff);
             copy_meta(meta + kMetaBScale, b_st + kBScaleOff);
             copy_meta(meta + kMetaBScale + 4,
@@ -548,7 +555,13 @@ __global__ void __launch_bounds__(kThreads, 1)
             mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
                             meta + kMetaAScale, meta + kMetaBScale);
           }
-          tc_commit(&empty_bar[stage]);
+          // Each commit tracks every earlier MMA, so a batch of commits
+          // after the newest step frees all of the batch's stages.
+          if (++pending == commit_group || k + 1 == it.k_end) {
+            for (int j = pending - 1; j >= 0; --j)
+              tc_commit(&empty_bar[(step - j) % kStages]);
+            pending = 0;
+          }
         }
         tc_commit(&acc_full_bar);
         if (tr) t_commit = gtime();
@@ -575,7 +588,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
         int const stage = step % kStages;
         mbar_wait(&full_bar[stage], (step / kStages) & 1);
-        if (p.meta_st) {
+        if (p.meta_st == 1) {
           uint8_t const* st = smem + stage * Cfg::kStageBytes;
           uint8_t const* b_st = st + Cfg::kBOff;
           uint4 v[4];
@@ -596,7 +609,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int const row = quarter * 32 + lane;
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
-    int local = 0;
+    int local = 0, meta_step = 0;
     long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
@@ -614,6 +627,26 @@ __global__ void __launch_bounds__(kThreads, 1)
             dst[j] = make_uint4(0, 0, 0, 0);
         }
         continue;
+      }
+
+      if (p.meta_st == 2) {
+        // Fill this item's metadata slots as its stages land; the MMAs for
+        // it cannot start before the previous item is drained anyway.
+        for (int k = it.k_begin; k < it.k_end; ++k, ++meta_step) {
+          int const stage = meta_step % kStages;
+          mbar_wait(&full_bar[stage], (meta_step / kStages) & 1);
+          uint8_t const* st = smem + stage * Cfg::kStageBytes;
+          uint8_t const* b_st = st + Cfg::kBOff;
+          uint4 v[4];
+          v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff)[lane];
+          v[1] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff)[lane];
+          v[2] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff +
+                                                kTileScaleBytes)[lane];
+          v[3] = reinterpret_cast<uint4 const*>(b_st + kBBookOff)[lane];
+          tmem_st16(lane_addr + kBlockN + stage * kMetaCols, v);
+          tc_fence_before();
+          mbar_arrive(&meta_bar[stage]);
+        }
       }
 
       float const w = (p.topk_weights != nullptr && valid)
@@ -707,15 +740,19 @@ __global__ void __launch_bounds__(kThreads, 1)
       trc[6] = gtime();
       trc[14] = c_acc;
     }
+    // TMEM may be freed once every epilogue load is done.
+    tc_fence_before();
+    mbar_arrive(&epi_done_bar);
   }
 
   tc_fence_before();
   __syncthreads();
-  if (tr && warp == kMmaWarp && lane == 0) {
-    trc[7] = gtime();
-    trc[15] = clock64() - c_entry;
-  }
   if (warp == kMmaWarp) {
+    mbar_wait(&epi_done_bar, 0);
+    if (tr && lane == 0) {
+      trc[7] = gtime();
+      trc[15] = clock64() - c_entry;
+    }
     tc_fence_after();
     asm volatile(
         "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1; "
@@ -935,7 +972,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
     int const smem_bytes = Config<kGroups>::kSmemBytes;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_bytes);
-    kernel<<<grid, kThreads, smem_bytes, stream>>>(params);
+    int const threads = params.meta_st == 2 ? kThreads - kMetaThreads : kThreads;
+    kernel<<<grid, threads, smem_bytes, stream>>>(params);
   };
   // With at most 8 routed rows every block fits one 8-row A group, and the
   // smaller stage buys a deeper weight ring. Otherwise blocks hold up to 32.
