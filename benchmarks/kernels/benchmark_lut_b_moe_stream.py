@@ -12,7 +12,6 @@ activation and output bytes, divided by kernel time.
 """
 
 import argparse
-import os
 import statistics
 
 import torch
@@ -28,7 +27,9 @@ from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
 TILE_BYTES = 6912
 
 
-def make_tiles(experts: int, n: int, k: int, copies: int) -> list[torch.Tensor]:
+def make_tiles(
+    experts: int, n: int, k: int, copies: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Random tiles with unit scales and finite codebooks, in both layouts."""
     out = []
     for _ in range(copies):
@@ -94,12 +95,6 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--copies", type=int, default=0, help="0: enough for 1 GB")
     p.add_argument("--split-k", default="0", help="list; 0 = auto")
-    p.add_argument(
-        "--trace",
-        action="store_true",
-        help="after timing, run each stream variant once more "
-        "(cold L2) with VLLM_LUT_B_STREAM_TRACE=1",
-    )
     args = p.parse_args()
     run, timer_name = timer()
     torch.manual_seed(0)
@@ -129,21 +124,32 @@ def main() -> None:
             hit = topk_ids.unique().numel()
             wbytes = hit * (n // 128) * (k // 128) * TILE_BYTES
             total = wbytes + a.numel() + a_s.numel() + c.numel() * 2
-            state = {"i": 0}
+            state = {"i": 0}  # rotates through the weight copies
 
-            def simple():
-                t = tiles[state["i"] % copies][0]
+            def simple(
+                a=a, a_s=a_s, c=c, w=topk_w, r=routing, tiles=tiles, state=state
+            ):
+                t = tiles[state["i"] % len(tiles)][0]
                 state["i"] += 1
-                ops.lut_b_moe_gemm(a, a_s, t, c, topk_w, *routing, args.top_k)
+                ops.lut_b_moe_gemm(a, a_s, t, c, w, *r, args.top_k)
 
             variants = [("simple", 1, simple)]
             for sk in map(int, args.split_k.split(",")):
 
-                def stream(sk=sk):
-                    t = tiles[state["i"] % copies][1]
+                def stream(
+                    sk=sk,
+                    a=a,
+                    a_s=a_s,
+                    c=c,
+                    w=topk_w,
+                    r=routing32,
+                    tiles=tiles,
+                    state=state,
+                ):
+                    t = tiles[state["i"] % len(tiles)][1]
                     state["i"] += 1
                     ops.lut_b_moe_gemm_stream(
-                        a, a_s, t, c, topk_w, *routing32, args.top_k, split_k=sk
+                        a, a_s, t, c, w, *r, args.top_k, split_k=sk
                     )
 
                 variants.append(("stream", sk, stream))
@@ -155,17 +161,6 @@ def main() -> None:
                     f"{wbytes / 1e6:.1f},{tbs:.2f},{100 * tbs / args.peak_tbs:.1f}",
                     flush=True,
                 )
-                if args.trace and name == "stream":
-                    flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
-                    os.environ["VLLM_LUT_B_STREAM_TRACE"] = "1"
-                    for _ in range(2):
-                        flush.zero_()
-                        torch.cuda.synchronize()
-                        fn()
-                        torch.cuda.synchronize()
-                    del os.environ["VLLM_LUT_B_STREAM_TRACE"]
-                    del flush
-        del tiles
 
 
 if __name__ == "__main__":

@@ -1,28 +1,25 @@
 // Weight-streaming grouped MoE GEMM for Rubin (SM107) LUT-B weights with
-// MXFP8 activations, tuned for small M (decode).
+// MXFP8 activations.
 //
 // C[sid, n] = sum_k A[sid / top_k, k] * W[expert, n, k] (* topk_weight[sid])
 //
-// Same operands and weight image as lut_b_moe_sm107.cu, but organized so the
-// weight stream, not latency, sets the speed when only a few tokens hit each
-// expert:
+// Same operands as lut_b_moe_sm107.cu, organized so the weight stream sets
+// the speed when few tokens hit each expert:
 //  * Persistent CTAs (one per SM) walk a static list of work items, each one
-//    (32-row routing block, 256-column N tile, K split). The weight stream
-//    keeps flowing across item boundaries. Routing uses blocks of 32 rows
+//    (32-row routing block, 256-column N tile, K split), and every role
+//    prefetches the next item's routing. Routing uses blocks of 32 rows
 //    (moe_align_block_size(..., 32)); the MMA is still M128, and its unused
 //    rows are never stored.
 //  * Warp-specialized: lane 0 of warp 0 streams weights with cp.async.bulk,
-//    lane 0 of warp 1 issues MMAs, warp 2 stages the few real activation rows
-//    with cp.async, warps 3-6 run the epilogue and warps 7-10 write each
-//    stage's scales and codebooks into its own TMEM slot (tcgen05.st), all
-//    through a deep shared-memory ring.
-//  * N = 256 MMAs. A M128 x N128 x K128 LUT-B step with MXFP8 A from shared
-//    memory takes about 184 clocks because the 16 KB A read dominates; at
-//    N = 256 the same A read feeds twice the columns and the step is
-//    math-bound at 256 clocks, 54 B of weights per clock per SM.
+//    lane 0 of warp 1 issues MMAs, warp 2 stages the real activation rows
+//    with cp.async, warps 3-6 run the epilogue, and warps 7-10 write each
+//    stage's scales and codebooks into its own TMEM slots (tcgen05.st).
+//  * A stage holds two K128 records: every stage costs each role a few
+//    barrier waits, fences and a commit, which bounded one-record stages.
 //  * Blocks with at most 8 real rows stage one 8-row core-matrix group of A
 //    and point every M group of the descriptor at it (SBO = 0), so A costs
-//    1 KB of shared memory per K128 instead of 16 KB.
+//    1 KB of shared memory per K128, and all four epilogue warps can drain
+//    the accumulator (each lane quarter holds the same rows).
 //  * Split-K with an in-kernel reduction when there are too few (M block,
 //    N tile) pairs to occupy every SM: each split writes FP32 partials, and
 //    the last split to finish a tile (per-tile counter) sums them and writes
@@ -33,17 +30,13 @@
 // (expert, 256 N, 128 K) one 13824 B record that is the stage image,
 //   [idx 0][idx 1][scales 0][scales 1][books 0][books 1]
 // where 0 and 1 are the two 128-column halves in the lut_b_moe_sm107.cu tile
-// format. Each K step is a single cp.async.bulk: the bulk path's cost is per
-// request, and splitting a stage into six copies cost about 20%.
+// format. Records are contiguous along K, so one cp.async.bulk fills a stage.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
-#include <cstdio>
-#include <vector>
 #include <optional>
 #include <type_traits>
 
@@ -201,13 +194,6 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
       : "memory");
 }
 
-__device__ __forceinline__ long long gtime() {
-  unsigned long long t;
-  // The memory clobber keeps the read from moving across barriers.
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)::"memory");
-  return static_cast<long long>(t);
-}
-
 __device__ __forceinline__ void tc_fence_after() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
@@ -325,15 +311,7 @@ struct Params {
   int N;
   int K;
   int splits;
-  // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
-  // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
-  // activation loads, 16 skips the epilogue's TMEM loads and stores.
-  int debug;
-  // TEMPORARY (VLLM_LUT_B_STREAM_TRACE): kTraceSlots timestamps per CTA.
-  long long* trace;
 };
-
-constexpr int kTraceSlots = 16;
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
 // CTAs that share a tile run at the same time.
@@ -377,10 +355,6 @@ __global__ void __launch_bounds__(kThreads, 1)
 
   int const warp = threadIdx.x / 32;
   int const lane = threadIdx.x % 32;
-  bool const tr = p.trace != nullptr;
-  long long* const trc = tr ? p.trace + blockIdx.x * kTraceSlots : nullptr;
-  long long const t_entry = tr ? gtime() : 0;
-  long long const c_entry = tr ? clock64() : 0;
 
   int const n_tiles = p.N / kBlockN;
   int const k_tiles = p.K / kBlockK;
@@ -420,54 +394,35 @@ __global__ void __launch_bounds__(kThreads, 1)
   __syncthreads();
   tc_fence_after();
   uint32_t const tmem = tmem_base;
-  if (tr && threadIdx.x == 0) {
-    trc[0] = t_entry;
-    trc[1] = gtime();
-  }
 
   // Every role walks the same items and the same ring of stages; a stage
   // holds up to kRecs consecutive K128 records of one item.
   if (warp == kProducerWarp) {
     // -------------------------------------------------------------- weights
     if (lane == 0) {
-      int stage = 0, steps = 0, items = 0;
+      int stage = 0;
       uint32_t phase = 0;
-      long long t_first = 0, t_last = 0, c_wait = 0;
       int expert_next = first_expert;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
         Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
         int const expert = expert_next;
         expert_next = expert_of(i + gridDim.x);
         if (expert < 0) continue;
-        ++items;
         // Paired records are the stage's weight image and are contiguous
         // along K, so one bulk copy fills a stage.
         uint8_t const* src =
             p.b + ((int64_t(expert) * n_tiles + it.n_tile) * k_tiles +
                    it.k_begin) *
                       kBStageBytes;
-        for (int k = it.k_begin; k < it.k_end; k += kRecs, ++steps) {
+        for (int k = it.k_begin; k < it.k_end; k += kRecs) {
           int const bytes = min(kRecs, it.k_end - k) * kBStageBytes;
-          long long const c0 = tr ? clock64() : 0;
           mbar_wait(&empty_bar[stage], phase ^ 1);
-          if (tr) {
-            c_wait += clock64() - c0;
-            t_last = gtime();
-            if (steps == 0) t_first = t_last;
-          }
           mbar_arrive_expect_tx(&full_bar[stage], bytes);
           bulk_copy(smem + stage * Cfg::kStageBytes + Cfg::kBOff, src, bytes,
                     &full_bar[stage]);
           src += bytes;
           if (++stage == kStages) stage = 0, phase ^= 1;
         }
-      }
-      if (tr) {
-        trc[2] = t_first;
-        trc[8] = t_last;
-        trc[11] = c_wait;
-        trc[12] = steps;
-        trc[13] = items;
       }
     }
     __syncwarp();
@@ -499,7 +454,6 @@ __global__ void __launch_bounds__(kThreads, 1)
       int32_t const token = valid ? sid / p.top_k : -1;
       int const count = __popc(__ballot_sync(0xffffffffu, valid));
       int groups = count <= 8 ? 1 : kAGroups;
-      if (p.debug & 8) groups = 0;
 
       // Per item, not per record: each lane copies 16-byte chunk lane % 8
       // of rows lane / 8 + 4j into the canonical K-major no-swizzle layout
@@ -558,9 +512,8 @@ __global__ void __launch_bounds__(kThreads, 1)
                              (uint32_t(kBlockM / 16) << 24) | (1u << 31);
       // The second K64 half uses scale byte 2 of each 4-byte A/B scale word.
       uint32_t const idesc_hi = idesc | (2u << 29) | (2u << 4);
-      int stage = 0, steps = 0, local = 0;
+      int stage = 0, local = 0;
       uint32_t phase = 0;
-      long long t_first = 0, t_last = 0, t_commit = 0, c_full = 0, c_acc = 0;
       int expert_next = first_expert;
       int const first_row8 = first.m_block * kRows + 8;
       int32_t sid8_next = first_row8 < p.num_sorted
@@ -582,58 +535,39 @@ __global__ void __launch_bounds__(kThreads, 1)
         // spread larger blocks over the quarters, made the MMAs slower.)
         int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 1024;
 
-        long long c0 = tr ? clock64() : 0;
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
-        if (tr) c_acc += clock64() - c0;
         tc_fence_after();
-        for (int k = it.k_begin; k < it.k_end; k += kRecs, ++steps) {
+        for (int k = it.k_begin; k < it.k_end; k += kRecs) {
           int const recs = min(kRecs, it.k_end - k);
-          if (tr) c0 = clock64();
           // Metadata warps arrive once the stage has landed and its TMEM
           // slots are written.
           mbar_wait(&meta_bar[stage], phase);
-          if (tr) {
-            c_full += clock64() - c0;
-            t_last = gtime();
-            if (steps == 0) t_first = t_last;
-          }
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           uint8_t* st = smem + stage * Cfg::kStageBytes;
-          if (!(p.debug & 4)) {
-            for (int r = 0; r < recs; ++r) {
-              uint32_t const meta =
-                  tmem + kBlockN + (stage * kRecs + r) * kMetaCols;
-              uint8_t* a_st = st + Cfg::kAOff + r * Cfg::kABytes;
-              uint64_t const a_lo = smem_desc(a_st, 128, a_sbo);
-              uint64_t const a_hi = smem_desc(a_st + 512, 128, a_sbo);
-              // Compressed B rows are 48 bytes; descriptor bit 53 selects
-              // the second K64 half of each row.
-              uint64_t const b_lo = smem_desc(
-                  st + Cfg::kBOff + r * kBStageBytes + kBIdxOff, 128, 384);
-              uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
-              mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
-                           meta + kMetaAScale, meta + kMetaBScale,
-                           k + r != it.k_begin);
-              mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2,
-                              idesc_hi, meta + kMetaAScale,
-                              meta + kMetaBScale);
-            }
+          for (int r = 0; r < recs; ++r) {
+            uint32_t const meta =
+                tmem + kBlockN + (stage * kRecs + r) * kMetaCols;
+            uint8_t* a_st = st + Cfg::kAOff + r * Cfg::kABytes;
+            uint64_t const a_lo = smem_desc(a_st, 128, a_sbo);
+            uint64_t const a_hi = smem_desc(a_st + 512, 128, a_sbo);
+            // Compressed B rows are 48 bytes; descriptor bit 53 selects the
+            // second K64 half of each row.
+            uint64_t const b_lo = smem_desc(
+                st + Cfg::kBOff + r * kBStageBytes + kBIdxOff, 128, 384);
+            uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
+            mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
+                         meta + kMetaAScale, meta + kMetaBScale,
+                         k + r != it.k_begin);
+            mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
+                            meta + kMetaAScale, meta + kMetaBScale);
           }
           tc_commit(&empty_bar[stage]);
           if (++stage == kStages) stage = 0, phase ^= 1;
         }
         tc_commit(&acc_full_bar);
-        if (tr) t_commit = gtime();
         ++local;
-      }
-      if (tr) {
-        trc[3] = t_first;
-        trc[4] = t_last;
-        trc[5] = t_commit;
-        trc[9] = c_full;
-        trc[10] = c_acc;
       }
     }
     __syncwarp();
@@ -677,7 +611,6 @@ __global__ void __launch_bounds__(kThreads, 1)
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
     int local = 0;
-    long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
       int32_t const* const blk = p.sorted_token_ids + it.m_block * kRows;
@@ -711,11 +644,9 @@ __global__ void __launch_bounds__(kThreads, 1)
                           ? p.topk_weights[sid]
                           : 1.0f;
       bool const direct = p.splits == 1;
-      long long const c0 = tr ? clock64() : 0;
       mbar_wait(&acc_full_bar, local & 1);
-      if (tr) c_acc += clock64() - c0;
       tc_fence_after();
-      if (!(p.debug & 16) && __any_sync(0xffffffffu, valid)) {
+      if (__any_sync(0xffffffffu, valid)) {
 #pragma unroll 1
         for (int n = n_begin; n < n_end; n += 32) {
           uint32_t v[32];
@@ -744,7 +675,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       tc_fence_before();
       mbar_arrive(&acc_empty_bar);
       ++local;
-      if (direct || (p.debug & 2)) continue;
+      if (direct) continue;
 
       // Split-K: the last split to finish this tile sums the partials.
       // Real rows are a prefix of the block, so count them per warp.
@@ -798,10 +729,6 @@ __global__ void __launch_bounds__(kThreads, 1)
       epilogue_bar();  // epi_* are rewritten for the next item
       if (threadIdx.x == kFirstEpilogueWarp * 32) *counter = 0;
     }
-    if (tr && quarter == 0 && lane == 0) {
-      trc[6] = gtime();
-      trc[14] = c_acc;
-    }
     // TMEM may be freed once every epilogue load is done.
     tc_fence_before();
     mbar_arrive(&epi_done_bar);
@@ -811,10 +738,6 @@ __global__ void __launch_bounds__(kThreads, 1)
   __syncthreads();
   if (warp == kMmaWarp) {
     mbar_wait(&epi_done_bar, 0);
-    if (tr && lane == 0) {
-      trc[7] = gtime();
-      trc[15] = clock64() - c_entry;
-    }
     tc_fence_after();
     asm volatile(
         "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1; "
@@ -823,69 +746,6 @@ __global__ void __launch_bounds__(kThreads, 1)
         "n"(kTmemCols)
         : "memory");
   }
-}
-
-// TEMPORARY: summarize VLLM_LUT_B_STREAM_TRACE timestamps on stderr.
-// Times are microseconds after the earliest CTA entry; waits are per-CTA
-// microseconds at the CTA's own measured SM clock.
-inline void print_trace(long long const* d_trace, int ctas,
-                        cudaStream_t stream, int64_t splits, int64_t N,
-                        int64_t K) {
-  std::vector<long long> t(size_t(ctas) * kTraceSlots);
-  cudaStreamSynchronize(stream);
-  cudaMemcpy(t.data(), d_trace, t.size() * sizeof(long long),
-             cudaMemcpyDeviceToHost);
-  auto at = [&](int c, int s) { return t[size_t(c) * kTraceSlots + s]; };
-  long long t0 = at(0, 0), tend = at(0, 7);
-  for (int c = 0; c < ctas; ++c) {
-    t0 = std::min(t0, at(c, 0));
-    tend = std::max(tend, at(c, 7));
-  }
-  auto stats = [&](char const* name, auto f) {
-    std::vector<double> v;
-    for (int c = 0; c < ctas; ++c) v.push_back(f(c));
-    std::sort(v.begin(), v.end());
-    std::fprintf(stderr, "  %-26s min %8.3f  p10 %8.3f  p50 %8.3f  p90 %8.3f  max %8.3f\n",
-                 name, v.front(), v[v.size() / 10], v[v.size() / 2],
-                 v[v.size() * 9 / 10], v.back());
-  };
-  auto rel = [&](int s) {
-    return [&, s](int c) { return at(c, s) ? (at(c, s) - t0) * 1e-3 : -1.0; };
-  };
-  // ns per cycle for CTA c
-  auto ghz = [&](int c) {
-    return double(at(c, 15)) / std::max<long long>(1, at(c, 7) - at(c, 0));
-  };
-  auto cyc = [&](int s) {
-    return [&, s](int c) { return at(c, s) / ghz(c) * 1e-3; };
-  };
-  std::fprintf(stderr,
-               "lut_b_stream trace: N=%lld K=%lld splits=%lld ctas=%d span "
-               "%.3f us (first entry to last exit)\n",
-               (long long)N, (long long)K, (long long)splits, ctas,
-               (tend - t0) * 1e-3);
-  stats("entry", rel(0));
-  stats("prologue done", rel(1));
-  stats("producer first issue", rel(2));
-  stats("mma first full", rel(3));
-  stats("producer last issue", rel(8));
-  stats("mma last full", rel(4));
-  stats("mma last acc commit", rel(5));
-  stats("epilogue done", rel(6));
-  stats("exit", rel(7));
-  stats("steps", [&](int c) { return double(at(c, 12)); });
-  stats("items", [&](int c) { return double(at(c, 13)); });
-  stats("sm GHz", ghz);
-  stats("producer wait empty us", cyc(11));
-  stats("mma wait full us", cyc(9));
-  stats("mma wait acc_empty us", cyc(10));
-  stats("epi wait acc_full us", cyc(14));
-  stats("steady GB/s (1st..last)", [&](int c) {
-    long long const dt = at(c, 4) - at(c, 3);
-    return at(c, 12) > 1 && dt > 0
-               ? double(at(c, 12) - 1) * kRecs * kBStageBytes / dt
-               : 0.0;
-  });
 }
 
 }  // namespace lut_b_moe_stream
@@ -1010,24 +870,10 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.N = static_cast<int>(N);
   params.K = static_cast<int>(K);
   params.splits = static_cast<int>(splits);
-  char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
-  params.debug = debug_env ? std::atoi(debug_env) : 0;
-  params.trace = nullptr;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
   cudaStream_t const stream = get_current_cuda_stream(device);
-  char const* trace_env = std::getenv("VLLM_LUT_B_STREAM_TRACE");
-  std::optional<torch::stable::Tensor> trace_buf;
-  if (trace_env && std::atoi(trace_env) != 0) {
-    trace_buf = torch::stable::empty({int64_t(grid.x) * kTraceSlots},
-                                     ScalarType::Long, std::nullopt,
-                                     a.device());
-    params.trace = reinterpret_cast<long long*>(trace_buf->mutable_data_ptr());
-    cudaMemsetAsync(params.trace, 0, sizeof(long long) * grid.x * kTraceSlots,
-                    stream);
-  }
-
   auto launch = [&](auto* out, auto groups) {
     using OutT = std::remove_pointer_t<decltype(out)>;
     constexpr int kGroups = decltype(groups)::value;
@@ -1057,6 +903,4 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   cudaError_t const err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess, "lut_b_moe_gemm_stream launch failed: ",
                   cudaGetErrorString(err));
-  if (params.trace != nullptr) print_trace(params.trace, grid.x, stream,
-                                           splits, N, K);
 }
