@@ -7,11 +7,14 @@
 // weight stream, not latency, sets the speed when only a few tokens hit each
 // expert:
 //  * Persistent CTAs (one per SM) walk a static list of work items, each one
-//    (128-row M block, 256-column N tile, K split). The weight stream keeps
-//    flowing across item boundaries.
-//  * Warp-specialized: warp 0 produces, lane 0 of warp 1 issues MMAs, warps
-//    2-5 run the epilogue. The producer fills a deep shared-memory ring with
-//    cp.async.bulk (weights) and cp.async (the few real activation rows).
+//    (32-row routing block, 256-column N tile, K split). The weight stream
+//    keeps flowing across item boundaries. Routing uses blocks of 32 rows
+//    (moe_align_block_size(..., 32)); the MMA is still M128, and its unused
+//    rows are never stored.
+//  * Warp-specialized: lane 0 of warp 0 streams weights with cp.async.bulk,
+//    lane 0 of warp 1 issues MMAs, warp 2 stages the few real activation rows
+//    with cp.async, and warps 3-6 run the epilogue, all through a deep
+//    shared-memory ring.
 //  * N = 256 MMAs. A M128 x N128 x K128 LUT-B step with MXFP8 A from shared
 //    memory takes about 184 clocks because the 16 KB A read dominates; at
 //    N = 256 the same A read feeds twice the columns and the step is
@@ -49,16 +52,18 @@
 namespace vllm {
 namespace lut_b_moe_stream {
 
-constexpr int kBlockM = 128;
+constexpr int kBlockM = 128;  // MMA M
+constexpr int kRows = 32;     // routed rows per block (moe_align_block_size)
 constexpr int kBlockN = 256;  // MMA N
 constexpr int kTileN = 128;   // N of one global weight tile
 constexpr int kBlockK = 128;
 
-constexpr int kProducerWarp = 0;
-constexpr int kMmaWarp = 1;
-constexpr int kFirstEpilogueWarp = 2;
+constexpr int kProducerWarp = 0;  // weights (lane 0)
+constexpr int kMmaWarp = 1;       // MMAs (lane 0)
+constexpr int kALoaderWarp = 2;   // activations
+constexpr int kFirstEpilogueWarp = 3;
 constexpr int kEpilogueThreads = 128;
-constexpr int kThreads = 64 + kEpilogueThreads;
+constexpr int kThreads = 96 + kEpilogueThreads;
 
 // Global weight tile (one 128 x 128 block).
 constexpr int kTileIdxBytes = kTileN * kBlockK * 3 / 8;  // 6144
@@ -66,7 +71,7 @@ constexpr int kTileScaleBytes = 512;
 constexpr int kTileBookBytes = kTileN / 8 * 16;  // 256
 constexpr int kTileBytes = kTileIdxBytes + kTileScaleBytes + kTileBookBytes;
 
-// Shared-memory stage: N256 weights, then A, then A scales.
+// N256 weights within a shared-memory stage, after A and the A scales.
 constexpr int kBIdxOff = 0;
 constexpr int kBScaleOff = 2 * kTileIdxBytes;                // 12288
 constexpr int kBBookOff = kBScaleOff + 2 * kTileScaleBytes;  // 13312
@@ -76,15 +81,21 @@ constexpr int kAScaleBytes = 512;
 // Leaves room for static shared memory under the 227 KB per-block limit.
 constexpr int kSmemBudget = 227 * 1024 - 4096;
 
+// Stage: [A, kAGroups 8-row groups x K128][A scales][weights]. A block of up
+// to 32 rows needs 4 A groups; the M128 MMA also reads groups 4-15, which
+// land on the rest of the stage and only feed accumulator rows never stored.
 template <int kAGroups>
 struct Config {
-  static constexpr int kABytes = kAGroups * 1024;  // 8 rows x K128 per group
-  static constexpr int kAOff = kBStageBytes;
-  static constexpr int kAScaleOff = kAOff + kABytes;
-  static constexpr int kStageBytes = kAScaleOff + kAScaleBytes;
+  static constexpr int kABytes = kAGroups * 1024;
+  static constexpr int kAOff = 0;
+  static constexpr int kAScaleOff = kABytes;
+  static constexpr int kBOff = kAScaleOff + kAScaleBytes;
+  static constexpr int kStageBytes = kBOff + kBStageBytes;
   static constexpr int kStages = kSmemBudget / kStageBytes;
   static constexpr int kSmemBytes = kStages * kStageBytes + 1024;
   static_assert(kStageBytes % 128 == 0);
+  static_assert(kAGroups == 1 || kStageBytes >= kBlockM / 8 * 1024);
+  static_assert(kAGroups * 8 <= kRows);
   static_assert(kStages >= 4);
 };
 
@@ -277,7 +288,9 @@ struct Params {
   int N;
   int K;
   int splits;
-  int debug;  // TEMPORARY profiling switches, see VLLM_LUT_B_STREAM_DEBUG
+  // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG): 2 skips the
+  // split-K reduction, 8 skips activation loads. Results are wrong.
+  int debug;
 };
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
@@ -311,7 +324,6 @@ __global__ void __launch_bounds__(kThreads, 1)
   __shared__ __align__(8) uint64_t empty_bar[kStages];
   __shared__ __align__(8) uint64_t acc_full_bar;
   __shared__ __align__(8) uint64_t acc_empty_bar;
-  __shared__ int32_t producer_rows[kBlockM];
   __shared__ uint32_t tmem_base;
   __shared__ int last_split;
   __shared__ int32_t epi_sid[kBlockM];
@@ -324,11 +336,11 @@ __global__ void __launch_bounds__(kThreads, 1)
   int const n_tiles = p.N / kBlockN;
   int const k_tiles = p.K / kBlockK;
   int const num_items =
-      (*p.num_tokens_post_padded / kBlockM) * n_tiles * p.splits;
+      (*p.num_tokens_post_padded / kRows) * n_tiles * p.splits;
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < kStages; ++s) {
-      // One expect_tx arrival plus one cp.async arrival per producer lane.
+      // One expect_tx arrival plus one cp.async arrival per A-loader lane.
       mbar_init(&full_bar[s], 1 + 32);
       mbar_init(&empty_bar[s], 1);
     }
@@ -349,77 +361,79 @@ __global__ void __launch_bounds__(kThreads, 1)
   uint32_t const tmem = tmem_base;
 
   if (warp == kProducerWarp) {
-    // ---------------------------------------------------------------- loads
-    uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
-                 : "=l"(policy));
+    // -------------------------------------------------------------- weights
+    if (lane == 0) {
+      uint64_t policy;
+      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
+                   : "=l"(policy));
+      int step = 0;
+      for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
+        Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+        int const expert = p.expert_ids[it.m_block];
+        if (expert < 0) continue;
+        uint8_t const* b0 = p.b + (int64_t(expert) * (p.N / kTileN) +
+                                   2 * it.n_tile) *
+                                      k_tiles * kTileBytes;
+        uint8_t const* b1 = b0 + int64_t(k_tiles) * kTileBytes;
+        for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
+          int const stage = step % kStages;
+          mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+          uint8_t* st = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
+          uint64_t* bar = &full_bar[stage];
+          mbar_arrive_expect_tx(bar, kExpectTxBytes);
+          uint8_t const* t0 = b0 + int64_t(k) * kTileBytes;
+          uint8_t const* t1 = b1 + int64_t(k) * kTileBytes;
+          bulk_copy(st + kBIdxOff, t0, kTileIdxBytes, bar, policy);
+          bulk_copy(st + kBIdxOff + kTileIdxBytes, t1, kTileIdxBytes, bar,
+                    policy);
+          bulk_copy(st + kBScaleOff, t0 + kTileIdxBytes, kTileScaleBytes, bar,
+                    policy);
+          bulk_copy(st + kBScaleOff + kTileScaleBytes, t1 + kTileIdxBytes,
+                    kTileScaleBytes, bar, policy);
+          bulk_copy(st + kBBookOff, t0 + kTileIdxBytes + kTileScaleBytes,
+                    kTileBookBytes, bar, policy);
+          bulk_copy(st + kBBookOff + kTileBookBytes,
+                    t1 + kTileIdxBytes + kTileScaleBytes, kTileBookBytes, bar,
+                    policy);
+        }
+      }
+    }
+    __syncwarp();
+  } else if (warp == kALoaderWarp) {
+    // ---------------------------------------------------------- activations
     int step = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      int const expert = p.expert_ids[it.m_block];
-      if (expert < 0) continue;
-
-      // Real rows are a prefix of the block; record their activation rows.
-      int count = 0;
-#pragma unroll
-      for (int j = 0; j < kBlockM / 32; ++j) {
-        int const r = j * 32 + lane;
-        int32_t const sid = p.sorted_token_ids[it.m_block * kBlockM + r];
-        bool const valid = sid < p.num_valid_tokens;
-        producer_rows[r] = valid ? sid / p.top_k : -1;
-        count += __popc(__ballot_sync(0xffffffffu, valid));
-      }
-      __syncwarp();
-      int const groups = count <= 8 ? 1 : min(kAGroups, (count + 7) / 8);
-
-      uint8_t const* b0 =
-          p.b + (int64_t(expert) * (p.N / kTileN) + 2 * it.n_tile) * k_tiles *
-                    kTileBytes;
-      uint8_t const* b1 = b0 + int64_t(k_tiles) * kTileBytes;
-
+      if (p.expert_ids[it.m_block] < 0) continue;
+      // Real rows are a prefix of the block; lane r owns row r.
+      int32_t const sid = p.sorted_token_ids[it.m_block * kRows + lane];
+      bool const valid = sid < p.num_valid_tokens;
+      int32_t const token = valid ? sid / p.top_k : -1;
+      int const count = __popc(__ballot_sync(0xffffffffu, valid));
+      int groups = count <= 8 ? 1 : kAGroups;
+      if (p.debug & 8) groups = 0;
       for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
         int const stage = step % kStages;
         mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
         uint8_t* st = smem + stage * Cfg::kStageBytes;
-        if (lane == 0) {
-          mbar_arrive_expect_tx(&full_bar[stage], kExpectTxBytes);
-          uint8_t const* t0 = b0 + int64_t(k) * kTileBytes;
-          uint8_t const* t1 = b1 + int64_t(k) * kTileBytes;
-          bulk_copy(st + kBIdxOff, t0, kTileIdxBytes, &full_bar[stage], policy);
-          bulk_copy(st + kBIdxOff + kTileIdxBytes, t1, kTileIdxBytes,
-                    &full_bar[stage], policy);
-          bulk_copy(st + kBScaleOff, t0 + kTileIdxBytes, kTileScaleBytes,
-                    &full_bar[stage], policy);
-          bulk_copy(st + kBScaleOff + kTileScaleBytes, t1 + kTileIdxBytes,
-                    kTileScaleBytes, &full_bar[stage], policy);
-          bulk_copy(st + kBBookOff, t0 + kTileIdxBytes + kTileScaleBytes,
-                    kTileBookBytes, &full_bar[stage], policy);
-          bulk_copy(st + kBBookOff + kTileBookBytes,
-                    t1 + kTileIdxBytes + kTileScaleBytes, kTileBookBytes,
-                    &full_bar[stage], policy);
-        }
-        // A in the canonical K-major no-swizzle layout: 8-row x 16-byte core
+        // Canonical K-major no-swizzle layout: 8-row x 16-byte core
         // matrices, 128 bytes apart along K and 1024 bytes apart along M.
-        uint8_t* a_st = st + Cfg::kAOff;
-        int const a_groups = (p.debug & 8) ? 0 : groups;
-        for (int c = lane; c < a_groups * 64; c += 32) {
+        for (int c = lane; c < groups * 64; c += 32) {
           int const r = c / 8, chunk = c % 8;
-          int32_t const row = producer_rows[r];
-          cp_async_16(a_st + (r / 8) * 1024 + (r % 8) * 16 + chunk * 128,
+          int32_t const row = __shfl_sync(0xffffffffu, token, r);
+          cp_async_16(st + Cfg::kAOff + (r / 8) * 1024 + (r % 8) * 16 +
+                          chunk * 128,
                       p.a + int64_t(max(row, 0)) * p.K + k * kBlockK +
                           chunk * 16,
                       row >= 0);
         }
-        // A scales: row r's four K32 scales land in lane r % 32, word r / 32.
-        for (int r = lane; r < a_groups * 8; r += 32) {
-          int32_t const row = producer_rows[r];
-          cp_async_4(st + Cfg::kAScaleOff + (r % 32) * 16 + (r / 32) * 4,
-                     p.a_scales + int64_t(max(row, 0)) * (p.K / 32) + k * 4,
-                     row >= 0);
-        }
+        // A scales: row r's four K32 scales land in lane r of the block.
+        if (lane < groups * 8)
+          cp_async_4(st + Cfg::kAScaleOff + lane * 16,
+                     p.a_scales + int64_t(max(token, 0)) * (p.K / 32) + k * 4,
+                     token >= 0);
         cp_async_arrive(&full_bar[stage]);
       }
-      __syncwarp();  // producer_rows is rewritten for the next item
     }
   } else if (warp == kMmaWarp) {
     // ----------------------------------------------------------------- MMAs
@@ -436,7 +450,7 @@ __global__ void __launch_bounds__(kThreads, 1)
         if (p.expert_ids[it.m_block] < 0) continue;
         // At most 8 real rows: every M group of the descriptor reads group 0.
         bool const small =
-            p.sorted_token_ids[it.m_block * kBlockM + 8] >= p.num_valid_tokens;
+            p.sorted_token_ids[it.m_block * kRows + 8] >= p.num_valid_tokens;
         int const a_sbo = small ? 0 : 1024;
 
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
@@ -446,25 +460,20 @@ __global__ void __launch_bounds__(kThreads, 1)
           mbar_wait(&full_bar[stage], (step / kStages) & 1);
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
-          if (!(p.debug & 4))
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           uint8_t* st = smem + stage * Cfg::kStageBytes;
+          uint8_t* b_st = st + Cfg::kBOff;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          if (!(p.debug & 1) || k == it.k_begin) {
-            copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
-            copy_meta(tmem + kTmemBScale, st + kBScaleOff);
-            copy_meta(tmem + kTmemBScale + 4,
-                      st + kBScaleOff + kTileScaleBytes);
-            copy_meta(tmem + kTmemBook, st + kBBookOff);
-          } else if (p.debug & 16) {
-            copy_meta(tmem + kTmemBook, st + kBBookOff);  // one copy per step
-          }
+          copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
+          copy_meta(tmem + kTmemBScale, b_st + kBScaleOff);
+          copy_meta(tmem + kTmemBScale + 4, b_st + kBScaleOff + kTileScaleBytes);
+          copy_meta(tmem + kTmemBook, b_st + kBBookOff);
           uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
           uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
           // Compressed B rows are 48 bytes; descriptor bit 53 selects the
           // second K64 half of each row.
-          uint64_t const b_lo = smem_desc(st + kBIdxOff, 128, 384);
+          uint64_t const b_lo = smem_desc(b_st + kBIdxOff, 128, 384);
           uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
           mma_lut_fill(tmem, a_lo, b_lo, tmem + kTmemBook, idesc,
                        tmem + kTmemAScale, tmem + kTmemBScale,
@@ -487,7 +496,9 @@ __global__ void __launch_bounds__(kThreads, 1)
     int local = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      int32_t const sid = p.sorted_token_ids[it.m_block * kBlockM + row];
+      int32_t const sid = row < kRows
+                              ? p.sorted_token_ids[it.m_block * kRows + row]
+                              : p.num_valid_tokens;
       bool const valid = sid < p.num_valid_tokens;
       int64_t const col0 = int64_t(it.n_tile) * kBlockN;
 
@@ -651,9 +662,9 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
                       split_counters.scalar_type() == ScalarType::Int,
                   "lut_b_moe_gemm_stream: routing tensors and split_counters "
                   "must be int32");
-  STD_TORCH_CHECK(expert_ids.size(0) * kBlockM >= sorted_token_ids.size(0),
+  STD_TORCH_CHECK(expert_ids.size(0) * kRows >= sorted_token_ids.size(0),
                   "lut_b_moe_gemm_stream: routing must be aligned to block "
-                  "size 128");
+                  "size 32");
   float const* topk_weights_ptr = nullptr;
   if (topk_weights.has_value()) {
     STD_TORCH_CHECK(topk_weights->scalar_type() == ScalarType::Float &&
@@ -737,13 +748,13 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
     kernel<<<grid, kThreads, smem_bytes, stream>>>(params);
   };
   // With at most 8 routed rows every block fits one 8-row A group, and the
-  // smaller stage buys a deeper weight ring.
+  // smaller stage buys a deeper weight ring. Otherwise blocks hold up to 32.
   bool const tiny = rows <= 8;
   auto dispatch = [&](auto* out) {
     if (tiny)
       launch(out, std::integral_constant<int, 1>{});
     else
-      launch(out, std::integral_constant<int, 16>{});
+      launch(out, std::integral_constant<int, 4>{});
   };
   if (c.scalar_type() == ScalarType::BFloat16) {
     dispatch(reinterpret_cast<__nv_bfloat16*>(c.mutable_data_ptr()));

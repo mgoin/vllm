@@ -270,7 +270,9 @@ def test_sm107_gemm_exact(workspace_init) -> None:
     )
 
 
-def _gemm_problem(num_tokens: int, num_experts: int, top_k: int, n: int, k: int):
+def _gemm_problem(
+    num_tokens: int, num_experts: int, top_k: int, n: int, k: int, block_m: int
+):
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
@@ -287,7 +289,7 @@ def _gemm_problem(num_tokens: int, num_experts: int, top_k: int, n: int, k: int)
     topk_weights = torch.rand(num_tokens, top_k, device="cuda")
     q = quantize_lut_b(w)
     a_q, a_s = mxfp8_e4m3_quantize(a)
-    routing = moe_align_block_size(topk_ids, 128, num_experts)
+    routing = moe_align_block_size(topk_ids, block_m, num_experts)
     a_ref = dequant_mxfp8_to_bf16(a_q, a_s.view(num_tokens, -1)).float()
     ref = (
         torch.einsum(
@@ -297,7 +299,8 @@ def _gemm_problem(num_tokens: int, num_experts: int, top_k: int, n: int, k: int)
         )
         * topk_weights[..., None].double()
     )
-    return a_q, a_s.view(num_tokens, -1), lut_b_to_sm107_tiles(*q), topk_weights, routing, ref
+    tiles = lut_b_to_sm107_tiles(*q)
+    return a_q, a_s.view(num_tokens, -1), tiles, topk_weights, topk_ids, routing, ref
 
 
 @requires_sm107
@@ -310,8 +313,8 @@ def test_sm107_stream_gemm_exact(
     """The weight-streaming kernel against an FP32 reference."""
     torch.manual_seed(4)
     num_experts, top_k = 6, 4
-    a_q, a_s, tiles, topk_weights, routing, ref = _gemm_problem(
-        num_tokens, num_experts, top_k, n, k
+    a_q, a_s, tiles, topk_weights, _, routing, ref = _gemm_problem(
+        num_tokens, num_experts, top_k, n, k, 32
     )
     sorted_ids, expert_ids, num_post_pad = routing
     out = torch.full((num_tokens * top_k, n), float("nan"), device="cuda").bfloat16()
@@ -340,16 +343,21 @@ def test_sm107_stream_matches_simple_kernel(workspace_init, num_tokens: int) -> 
     """Without split-K both kernels sum each K128 step in the same order."""
     torch.manual_seed(5)
     num_experts, top_k, n, k = 8, 4, 512, 512
-    a_q, a_s, tiles, topk_weights, routing, _ = _gemm_problem(
-        num_tokens, num_experts, top_k, n, k
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    a_q, a_s, tiles, topk_weights, topk_ids, routing, _ = _gemm_problem(
+        num_tokens, num_experts, top_k, n, k, 128
     )
     outs = []
     for stream in (False, True):
         out = torch.empty((num_tokens * top_k, n), device="cuda").bfloat16()
-        args = (a_q, a_s, tiles, out, topk_weights.flatten(), *routing, top_k)
+        args = (a_q, a_s, tiles, out, topk_weights.flatten())
         if stream:
-            ops.lut_b_moe_gemm_stream(*args, split_k=1)
+            routing = moe_align_block_size(topk_ids, 32, num_experts)
+            ops.lut_b_moe_gemm_stream(*args, *routing, top_k, split_k=1)
         else:
-            ops.lut_b_moe_gemm(*args)
+            ops.lut_b_moe_gemm(*args, *routing, top_k)
         outs.append(out)
     torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)

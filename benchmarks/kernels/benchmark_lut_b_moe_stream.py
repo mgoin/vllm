@@ -103,6 +103,7 @@ def main() -> None:
             a = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
             a_s = torch.full((m, k // 32), 127, dtype=torch.uint8, device="cuda")
             routing = moe_align_block_size(topk_ids, 128, args.experts)
+            routing32 = moe_align_block_size(topk_ids, 32, args.experts)
             c = torch.empty(m * args.top_k, n, device="cuda", dtype=torch.bfloat16)
             hit = topk_ids.unique().numel()
             wbytes = hit * (n // 128) * (k // 128) * TILE_BYTES
@@ -120,7 +121,7 @@ def main() -> None:
                     t = tiles[state["i"] % copies]
                     state["i"] += 1
                     ops.lut_b_moe_gemm_stream(
-                        a, a_s, t, c, topk_w, *routing, args.top_k, split_k=sk
+                        a, a_s, t, c, topk_w, *routing32, args.top_k, split_k=sk
                     )
                 variants.append(("stream", sk, stream))
             for name, sk, fn in variants:

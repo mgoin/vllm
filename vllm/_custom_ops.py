@@ -2276,8 +2276,9 @@ def lut_b_moe_gemm_stream(
 ) -> None:
     """Weight-streaming variant of `lut_b_moe_gemm` for small M.
 
-    Same operands and result. Needs N to be a multiple of 256. `split_k`
-    <= 0 picks the K split from the problem size. The split-K tile counters
+    Same operands and result, but routing is aligned to blocks of 32 rows
+    (`moe_align_block_size(topk_ids, 32, ...)`) and N must be a multiple of
+    256. `split_k` <= 0 picks the K split from the problem size. The split-K tile counters
     are kept zero by the kernel, so one buffer per device is reused.
     """
     needed = expert_ids.size(0) * (c.size(1) // 256)
