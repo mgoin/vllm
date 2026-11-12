@@ -65,7 +65,11 @@ constexpr int kMmaWarp = 1;       // MMAs (lane 0)
 constexpr int kALoaderWarp = 2;   // activations
 constexpr int kFirstEpilogueWarp = 3;
 constexpr int kEpilogueThreads = 128;
-constexpr int kThreads = 96 + kEpilogueThreads;
+// EXPERIMENT: four more warps that can load weights with cp.async (LSU path)
+// instead of, or alongside, the bulk copy (VLLM_LUT_B_STREAM_WLOAD).
+constexpr int kFirstWLoadWarp = kFirstEpilogueWarp + kEpilogueThreads / 32;
+constexpr int kWLoadThreads = 128;
+constexpr int kThreads = 96 + kEpilogueThreads + kWLoadThreads;
 
 // Global weight tile (one 128 x 128 block).
 constexpr int kTileIdxBytes = kTileN * kBlockK * 3 / 8;  // 6144
@@ -293,6 +297,7 @@ struct Params {
   // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
   // skips the epilogue's TMEM loads and stores.
   int debug;
+  int wload;  // EXPERIMENT: 0 bulk, 1 cp.async, 2 half bulk / half cp.async
 };
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
@@ -343,7 +348,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (threadIdx.x == 0) {
     for (int s = 0; s < kStages; ++s) {
       // One expect_tx arrival plus one cp.async arrival per A-loader lane.
-      mbar_init(&full_bar[s], 1 + 32);
+      mbar_init(&full_bar[s], 1 + 32 + kWLoadThreads);
       mbar_init(&empty_bar[s], 1);
     }
     mbar_init(&acc_full_bar, 1);
@@ -378,9 +383,20 @@ __global__ void __launch_bounds__(kThreads, 1)
           int const stage = step % kStages;
           mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
           uint64_t* bar = &full_bar[stage];
-          mbar_arrive_expect_tx(bar, kBStageBytes);
-          bulk_copy(smem + stage * Cfg::kStageBytes + Cfg::kBOff,
-                    src + int64_t(k) * kBStageBytes, kBStageBytes, bar);
+          uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
+          uint8_t const* rec = src + int64_t(k) * kBStageBytes;
+          if (p.wload == 0) {
+            mbar_arrive_expect_tx(bar, kBStageBytes);
+            bulk_copy(dst, rec, kBStageBytes, bar);
+          } else if (p.wload == 2) {
+            // Index half 0 plus scales and books by bulk, half 1 by cp.async.
+            mbar_arrive_expect_tx(bar, kBStageBytes - kTileIdxBytes);
+            bulk_copy(dst, rec, kTileIdxBytes, bar);
+            bulk_copy(dst + kBScaleOff, rec + kBScaleOff,
+                      kBStageBytes - kBScaleOff, bar);
+          } else {
+            mbar_arrive(bar);
+          }
         }
       }
     }
@@ -478,6 +494,30 @@ __global__ void __launch_bounds__(kThreads, 1)
       }
     }
     __syncwarp();
+  } else if (warp >= kFirstWLoadWarp) {
+    // ------------------------------------------- weights over cp.async (exp)
+    int const t = threadIdx.x - kFirstWLoadWarp * 32;
+    int const chunk_begin = p.wload == 2 ? kTileIdxBytes / 16 : 0;
+    int const chunk_end = p.wload == 2   ? 2 * kTileIdxBytes / 16
+                          : p.wload == 1 ? kBStageBytes / 16
+                                         : 0;
+    int step = 0;
+    for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
+      Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+      int const expert = p.expert_ids[it.m_block];
+      if (expert < 0) continue;
+      uint8_t const* src = p.b + (int64_t(expert) * n_tiles + it.n_tile) *
+                                     k_tiles * kBStageBytes;
+      for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
+        int const stage = step % kStages;
+        mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+        uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
+        uint8_t const* rec = src + int64_t(k) * kBStageBytes;
+        for (int c = chunk_begin + t; c < chunk_end; c += kWLoadThreads)
+          cp_async_16(dst + c * 16, rec + c * 16, true);
+        cp_async_arrive(&full_bar[stage]);
+      }
+    }
   } else {
     // ------------------------------------------------------------- epilogue
     int const quarter = warp % 4;  // TMEM lanes this warp may access
@@ -724,6 +764,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.splits = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
+  char const* wload_env = std::getenv("VLLM_LUT_B_STREAM_WLOAD");
+  params.wload = wload_env ? std::atoi(wload_env) : 0;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
