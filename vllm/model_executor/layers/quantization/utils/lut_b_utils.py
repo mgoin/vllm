@@ -294,7 +294,9 @@ def lut_b_sm107_pair_tiles(tiles: torch.Tensor) -> torch.Tensor:
     """
     num_experts, nt, kt, _ = tiles.shape
     if nt % 2:
-        raise ValueError(f"pairing SM107 tiles needs N divisible by 256, got {nt * 128}")
+        raise ValueError(
+            f"pairing SM107 tiles needs N divisible by 256, got {nt * 128}"
+        )
     halves = tiles.view(num_experts, nt // 2, 2, kt, LUT_B_SM107_TILE_BYTES)
     halves = halves.transpose(2, 3)  # [E, N / 256, K / 128, 2, 6912]
     parts = (
@@ -302,6 +304,4 @@ def lut_b_sm107_pair_tiles(tiles: torch.Tensor) -> torch.Tensor:
         halves[..., 6144:6656],
         halves[..., 6656:],
     )
-    return torch.cat(
-        [part.flatten(-2) for part in parts], dim=-1
-    ).contiguous()
+    return torch.cat([part.flatten(-2) for part in parts], dim=-1).contiguous()

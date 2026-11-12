@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
     LUT_B_SM107_TILE_K,
     LUT_B_SM107_TILE_N,
     dequantize_lut_b,
+    lut_b_sm107_pair_tiles,
     lut_b_to_sm107_tiles,
     quantize_lut_b,
 )
@@ -93,6 +94,10 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
             packed, codebooks, scales = quantize_lut_b(weight)
             if self.experts_cls is LutBSm107Experts:
                 weight = lut_b_to_sm107_tiles(packed, codebooks, scales)
+                # N divisible by 256: the paired layout of the faster
+                # weight-streaming kernel.
+                if weight.size(1) % 2 == 0:
+                    weight = lut_b_sm107_pair_tiles(weight)
             else:
                 weight = dequantize_lut_b(packed, codebooks, scales, weight.dtype)
             replace_parameter(layer, name, weight)

@@ -125,7 +125,9 @@ def test_sm107_pair_tiles() -> None:
     assert paired.shape == (2, 2, 3, 13824)
     for half in range(2):
         tile = tiles[:, half::2]
-        assert torch.equal(paired[..., half * 6144 : (half + 1) * 6144], tile[..., :6144])
+        assert torch.equal(
+            paired[..., half * 6144 : (half + 1) * 6144], tile[..., :6144]
+        )
         assert torch.equal(
             paired[..., 12288 + half * 512 : 12288 + (half + 1) * 512],
             tile[..., 6144:6656],
@@ -207,12 +209,20 @@ def test_emulation_matches_reference(workspace_init, num_tokens: int) -> None:
     _assert_close(actual, expected)
 
 
+def _sm107_weights(q, pair: bool) -> torch.Tensor:
+    """Native tiles, paired as LutBOnlineMoEMethod does when N allows it."""
+    tiles = lut_b_to_sm107_tiles(*q)
+    return lut_b_sm107_pair_tiles(tiles) if pair and tiles.size(1) % 2 == 0 else tiles
+
+
 @requires_sm107
 @pytest.mark.parametrize("num_tokens", [1, 33, 300])
-@pytest.mark.parametrize("hidden,inter", [(256, 128), (512, 384)])
+@pytest.mark.parametrize("hidden,inter", [(256, 128), (512, 384), (384, 128)])
+@pytest.mark.parametrize("pair", [False, True])
 def test_sm107_matches_emulation(
-    workspace_init, num_tokens: int, hidden: int, inter: int
+    workspace_init, num_tokens: int, hidden: int, inter: int, pair: bool
 ) -> None:
+    """Both native kernels; (384, 128) pairs w13 (N = 256) but not w2."""
     torch.manual_seed(2)
     num_experts, top_k = 8, 4
     x, w13, w2, topk_weights, topk_ids = _make_problem(
@@ -222,8 +232,8 @@ def test_sm107_matches_emulation(
 
     native = _run(
         LutBSm107Experts,
-        lut_b_to_sm107_tiles(*q13),
-        lut_b_to_sm107_tiles(*q2),
+        _sm107_weights(q13, pair),
+        _sm107_weights(q2, pair),
         x,
         topk_weights,
         topk_ids,

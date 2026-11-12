@@ -2274,17 +2274,23 @@ def lut_b_moe_gemm_stream(
     top_k: int,
     split_k: int = 0,
 ) -> None:
-    """Weight-streaming variant of `lut_b_moe_gemm` for small M.
+    """Weight-streaming variant of `lut_b_moe_gemm`.
 
     Same operands and result, but routing is aligned to blocks of 32 rows
-    (`moe_align_block_size(topk_ids, 32, ...)`) and N must be a multiple of
-    256. `split_k` <= 0 picks the K split from the problem size. The split-K tile counters
-    are kept zero by the kernel, so one buffer per device is reused.
+    (`moe_align_block_size(topk_ids, 32, ...)`) and `b` is in the paired
+    layout from `lut_b_sm107_pair_tiles` (N a multiple of 256). `split_k`
+    <= 0 picks the K split from the problem size. The kernel keeps the
+    split-K tile counters zero, so one buffer per device is reused. The
+    automatic split only splits when there are at most one tile per two SMs,
+    so 4096 counters always suffice for it and the buffer never grows during
+    CUDA graph capture.
     """
-    needed = expert_ids.size(0) * (c.size(1) // 256)
+    needed = 4096
+    if split_k > 0:
+        needed = max(needed, min(expert_ids.size(0), c.size(0)) * (c.size(1) // 256))
     counters = _lut_b_split_counters.get(c.device)
     if counters is None or counters.numel() < needed:
-        counters = torch.zeros(max(needed, 4096), dtype=torch.int32, device=c.device)
+        counters = torch.zeros(needed, dtype=torch.int32, device=c.device)
         _lut_b_split_counters[c.device] = counters
     torch.ops._moe_C.lut_b_moe_gemm_stream(
         a,

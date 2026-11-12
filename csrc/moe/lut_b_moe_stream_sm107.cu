@@ -981,10 +981,12 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   float* partials = nullptr;
   std::optional<torch::stable::Tensor> partials_buf;
   if (splits > 1) {
+    // Counters are indexed by real blocks, each holding at least one row.
+    int64_t const counters_needed = std::min(num_m_blocks, rows) * n_tiles;
     STD_TORCH_CHECK(split_counters.is_contiguous() &&
-                        split_counters.numel() >= num_m_blocks * n_tiles,
+                        split_counters.numel() >= counters_needed,
                     "lut_b_moe_gemm_stream: split_counters needs ",
-                    num_m_blocks * n_tiles, " zero-initialized int32 entries");
+                    counters_needed, " zero-initialized int32 entries");
     partials_buf = torch::stable::empty({splits, rows, N}, ScalarType::Float,
                                         std::nullopt, a.device());
     partials = partials_buf->mutable_data_ptr<float>();

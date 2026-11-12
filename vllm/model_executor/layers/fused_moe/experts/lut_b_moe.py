@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.moe_output import route_major_moe_output
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
+    LUT_B_SM107_PAIR_TILE_BYTES,
     LUT_B_SM107_TILE_K,
     LUT_B_SM107_TILE_N,
 )
@@ -42,8 +43,10 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-# The SM107 kernel computes 128 x 128 output tiles of one expert.
+# Routing block sizes of the SM107 kernels: `lut_b_moe_gemm` computes
+# 128 x 128 output tiles, `lut_b_moe_gemm_stream` 32-row blocks.
 LUT_B_SM107_BLOCK_M = 128
+LUT_B_SM107_STREAM_BLOCK_M = 32
 
 
 def mxfp8_qdq(x: torch.Tensor) -> torch.Tensor:
@@ -145,9 +148,21 @@ class LutBEmulationTritonExperts(_LutBExpertsBase):
 class LutBSm107Experts(_LutBExpertsBase):
     """Native Rubin LUT-B x MXFP8 MoE.
 
-    A simple path: MXFP8-quantize the activations, then run two grouped GEMMs
-    (`ops.lut_b_moe_gemm`) over routing aligned to 128-row blocks.
+    MXFP8-quantize the activations, then run two grouped GEMMs. Weights in
+    the paired layout (`lut_b_sm107_pair_tiles`, N divisible by 256) use the
+    weight-streaming kernel over 32-row routing blocks, which is faster at
+    every batch size measured (1 to 4096 tokens). Other weights use
+    `ops.lut_b_moe_gemm` over 128-row blocks.
     """
+
+    @staticmethod
+    def _is_paired(w: torch.Tensor) -> bool:
+        return w.size(3) == LUT_B_SM107_PAIR_TILE_BYTES
+
+    @staticmethod
+    def _tile_n(w: torch.Tensor) -> int:
+        paired = LutBSm107Experts._is_paired(w)
+        return LUT_B_SM107_TILE_N * (2 if paired else 1)
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -168,11 +183,11 @@ class LutBSm107Experts(_LutBExpertsBase):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
-        # Weights are [E, N / 128, K / 128, tile bytes].
+        # Weights are [E, N / tile N, K / 128, tile bytes].
         num_experts = w1.size(0)
-        n = w1.size(1) * LUT_B_SM107_TILE_N
+        n = w1.size(1) * self._tile_n(w1)
         k = w1.size(2) * LUT_B_SM107_TILE_K
-        assert a1.size(-1) == k and w2.size(1) * LUT_B_SM107_TILE_N == k
+        assert a1.size(-1) == k and w2.size(1) * self._tile_n(w2) == k
         return num_experts, a1.size(0), n, k, topk_ids.size(1)
 
     def apply(
@@ -205,27 +220,25 @@ class LutBSm107Experts(_LutBExpertsBase):
                 "router weights on the input."
             )
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids,
-            LUT_B_SM107_BLOCK_M,
-            global_num_experts,
-            expert_map,
-            ignore_invalid_experts=expert_map is not None,
-        )
+        routings: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+        def gemm(a, a_scales, w, c, weights, top_k):
+            paired = self._is_paired(w)
+            block_m = LUT_B_SM107_STREAM_BLOCK_M if paired else LUT_B_SM107_BLOCK_M
+            if block_m not in routings:
+                routings[block_m] = moe_align_block_size(
+                    topk_ids,
+                    block_m,
+                    global_num_experts,
+                    expert_map,
+                    ignore_invalid_experts=expert_map is not None,
+                )
+            run = ops.lut_b_moe_gemm_stream if paired else ops.lut_b_moe_gemm
+            run(a, a_scales, w, c, weights, *routings[block_m], top_k)
 
         cache1 = _resize_cache(workspace2, (num_tokens * top_k, n))
         a1, a1_scales = mxfp8_e4m3_quantize(hidden_states)
-        ops.lut_b_moe_gemm(
-            a1,
-            a1_scales.view(num_tokens, -1),
-            w1,
-            cache1,
-            None,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            top_k,
-        )
+        gemm(a1, a1_scales.view(num_tokens, -1), w1, cache1, None, top_k)
 
         cache2 = _resize_cache(
             workspace13,
@@ -235,7 +248,7 @@ class LutBSm107Experts(_LutBExpertsBase):
 
         cache3 = _resize_cache(workspace2, (num_tokens, top_k, k))
         a2, a2_scales = mxfp8_e4m3_quantize(cache2)
-        ops.lut_b_moe_gemm(
+        gemm(
             a2,
             a2_scales.view(cache2.size(0), -1),
             w2,
@@ -243,9 +256,6 @@ class LutBSm107Experts(_LutBExpertsBase):
             None
             if hooked or apply_router_weight_on_input
             else topk_weights.float().contiguous(),
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
             1,
         )
         if hooked:

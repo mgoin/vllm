@@ -33,7 +33,10 @@ def make_tiles(experts: int, n: int, k: int, copies: int) -> list[torch.Tensor]:
     out = []
     for _ in range(copies):
         t = torch.randint(
-            0, 256, (experts, n // 128, k // 128, TILE_BYTES), dtype=torch.uint8,
+            0,
+            256,
+            (experts, n // 128, k // 128, TILE_BYTES),
+            dtype=torch.uint8,
             device="cuda",
         )
         t[..., 6144:6656] = 127  # unit UE8M0 scales
@@ -49,7 +52,10 @@ def timer():
         def run(fn, iters):
             try:
                 times = bench_gpu_time(
-                    fn, dry_run_iters=5, repeat_iters=iters, enable_cupti=True,
+                    fn,
+                    dry_run_iters=5,
+                    repeat_iters=iters,
+                    enable_cupti=True,
                     cold_l2_cache=True,
                 )
             except TypeError:
@@ -88,14 +94,19 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--copies", type=int, default=0, help="0: enough for 1 GB")
     p.add_argument("--split-k", default="0", help="list; 0 = auto")
-    p.add_argument("--trace", action="store_true",
-                   help="after timing, run each stream variant once more "
-                   "(cold L2) with VLLM_LUT_B_STREAM_TRACE=1")
+    p.add_argument(
+        "--trace",
+        action="store_true",
+        help="after timing, run each stream variant once more "
+        "(cold L2) with VLLM_LUT_B_STREAM_TRACE=1",
+    )
     args = p.parse_args()
     run, timer_name = timer()
     torch.manual_seed(0)
-    print(f"timer={timer_name} device={torch.cuda.get_device_name()} "
-          f"sms={torch.cuda.get_device_properties(0).multi_processor_count}")
+    print(
+        f"timer={timer_name} device={torch.cuda.get_device_name()} "
+        f"sms={torch.cuda.get_device_properties(0).multi_processor_count}"
+    )
     print("shape,tokens,experts_hit,split,kernel,us,weight_MB,TB/s,%peak")
     for shape in args.shapes.split(","):
         n, k = map(int, shape.split("x"))
@@ -104,8 +115,10 @@ def main() -> None:
         tiles = make_tiles(args.experts, n, k, copies)
         for m in map(int, args.tokens.split(",")):
             topk_ids = torch.stack(
-                [torch.randperm(args.experts, device="cuda")[: args.top_k]
-                 for _ in range(m)]
+                [
+                    torch.randperm(args.experts, device="cuda")[: args.top_k]
+                    for _ in range(m)
+                ]
             ).to(torch.int32)
             topk_w = torch.rand(m, args.top_k, device="cuda").flatten()
             a = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
@@ -125,19 +138,23 @@ def main() -> None:
 
             variants = [("simple", 1, simple)]
             for sk in map(int, args.split_k.split(",")):
+
                 def stream(sk=sk):
                     t = tiles[state["i"] % copies][1]
                     state["i"] += 1
                     ops.lut_b_moe_gemm_stream(
                         a, a_s, t, c, topk_w, *routing32, args.top_k, split_k=sk
                     )
+
                 variants.append(("stream", sk, stream))
             for name, sk, fn in variants:
                 us = run(fn, args.iters)
                 tbs = total / us / 1e6
-                print(f"{n}x{k},{m},{hit},{sk},{name},{us:.2f},"
-                      f"{wbytes / 1e6:.1f},{tbs:.2f},{100 * tbs / args.peak_tbs:.1f}",
-                      flush=True)
+                print(
+                    f"{n}x{k},{m},{hit},{sk},{name},{us:.2f},"
+                    f"{wbytes / 1e6:.1f},{tbs:.2f},{100 * tbs / args.peak_tbs:.1f}",
+                    flush=True,
+                )
                 if args.trace and name == "stream":
                     flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
                     os.environ["VLLM_LUT_B_STREAM_TRACE"] = "1"
