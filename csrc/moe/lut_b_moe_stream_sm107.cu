@@ -34,6 +34,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -275,6 +276,7 @@ struct Params {
   int N;
   int K;
   int splits;
+  int debug;  // TEMPORARY profiling switches, see VLLM_LUT_B_STREAM_DEBUG
 };
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
@@ -395,7 +397,8 @@ __global__ void __launch_bounds__(kThreads, 1)
         // A in the canonical K-major no-swizzle layout: 8-row x 16-byte core
         // matrices, 128 bytes apart along K and 1024 bytes apart along M.
         uint8_t* a_st = st + Cfg::kAOff;
-        for (int c = lane; c < groups * 64; c += 32) {
+        int const a_groups = (p.debug & 8) ? 0 : groups;
+        for (int c = lane; c < a_groups * 64; c += 32) {
           int const r = c / 8, chunk = c % 8;
           int32_t const row = producer_rows[r];
           cp_async_16(a_st + (r / 8) * 1024 + (r % 8) * 16 + chunk * 128,
@@ -404,7 +407,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                       row >= 0);
         }
         // A scales: row r's four K32 scales land in lane r % 32, word r / 32.
-        for (int r = lane; r < groups * 8; r += 32) {
+        for (int r = lane; r < a_groups * 8; r += 32) {
           int32_t const row = producer_rows[r];
           cp_async_4(st + Cfg::kAScaleOff + (r % 32) * 16 + (r / 32) * 4,
                      p.a_scales + int64_t(max(row, 0)) * (p.K / 32) + k * 4,
@@ -439,14 +442,20 @@ __global__ void __launch_bounds__(kThreads, 1)
           mbar_wait(&full_bar[stage], (step / kStages) & 1);
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
-          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          if (!(p.debug & 4))
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           uint8_t* st = smem + stage * Cfg::kStageBytes;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
-          copy_meta(tmem + kTmemBScale, st + kBScaleOff);
-          copy_meta(tmem + kTmemBScale + 4, st + kBScaleOff + kTileScaleBytes);
-          copy_meta(tmem + kTmemBook, st + kBBookOff);
+          if (!(p.debug & 1) || k == it.k_begin) {
+            copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
+            copy_meta(tmem + kTmemBScale, st + kBScaleOff);
+            copy_meta(tmem + kTmemBScale + 4,
+                      st + kBScaleOff + kTileScaleBytes);
+            copy_meta(tmem + kTmemBook, st + kBBookOff);
+          } else if (p.debug & 16) {
+            copy_meta(tmem + kTmemBook, st + kBBookOff);  // one copy per step
+          }
           uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
           uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
           // Compressed B rows are 48 bytes; descriptor bit 53 selects the
@@ -523,7 +532,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       tc_fence_before();
       mbar_arrive(&acc_empty_bar);
       ++local;
-      if (direct) continue;
+      if (direct || (p.debug & 2)) continue;
 
       // Split-K: the last split to finish this tile sums the partials.
       __threadfence();
@@ -623,7 +632,7 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
                       split_counters.scalar_type() == ScalarType::Int,
                   "lut_b_moe_gemm_stream: routing tensors and split_counters "
                   "must be int32");
-  STD_TORCH_CHECK(expert_ids.size(0) * kBlockM <= sorted_token_ids.size(0),
+  STD_TORCH_CHECK(expert_ids.size(0) * kBlockM >= sorted_token_ids.size(0),
                   "lut_b_moe_gemm_stream: routing must be aligned to block "
                   "size 128");
   float const* topk_weights_ptr = nullptr;
@@ -691,6 +700,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.N = static_cast<int>(N);
   params.K = static_cast<int>(K);
   params.splits = static_cast<int>(splits);
+  char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
+  params.debug = debug_env ? std::atoi(debug_env) : 0;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
