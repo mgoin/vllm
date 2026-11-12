@@ -23,8 +23,10 @@
 //  * Blocks with at most 8 real rows stage one 8-row core-matrix group of A
 //    and point every M group of the descriptor at it (SBO = 0), so A costs
 //    1 KB of shared memory per K128 instead of 16 KB.
-//  * Split-K with an in-kernel reduction when there are too few (M block,
-//    N tile) pairs to occupy every SM: each split writes FP32 partials, and
+//  * Split-K with an in-kernel reduction, chosen on the device from the
+//    routing length so the last wave of items is spread evenly over the
+//    SMs (and so tiny batches still use every SM): each split writes FP32
+//    partials, and
 //    the last split to finish a tile (per-tile counter) sums them and writes
 //    the output. Counters are reset by the kernel, so they stay zero between
 //    launches.
@@ -313,7 +315,7 @@ struct Params {
   uint8_t const* a_scales;
   uint8_t const* b;
   void* c;
-  float* partials;    // [splits, num_valid_tokens, N] when splits > 1
+  float* partials;    // [split_max, num_valid_tokens, N] when split_max > 1
   int32_t* counters;  // [num_m_blocks * n_tiles], zero between launches
   float const* topk_weights;
   int32_t const* sorted_token_ids;
@@ -324,7 +326,8 @@ struct Params {
   int top_k;
   int N;
   int K;
-  int splits;
+  int split_fixed;  // K splits per tile, or 0 to choose from the routing
+  int split_max;
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
   // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
   // activation loads, 16 skips the epilogue's TMEM loads and stores.
@@ -333,7 +336,22 @@ struct Params {
   long long* trace;
 };
 
-constexpr int kTraceSlots = 16;
+constexpr int kTraceSlots = 17;
+
+// K splits per (M block, N tile) for `tiles` tiles on `ctas` persistent CTAs:
+// the fewest K records on the busiest CTA, with a small charge for the
+// partial-sum round trip that any split adds.
+__device__ __forceinline__ int choose_splits(int tiles, int k_tiles, int ctas,
+                                             int split_max) {
+  int best = 1;
+  float best_cost = float((tiles + ctas - 1) / ctas) * k_tiles;
+  for (int s = 2; s <= split_max; ++s) {
+    float const cost =
+        float((tiles * s + ctas - 1) / ctas) * k_tiles / s * 1.03f;
+    if (cost < best_cost) best = s, best_cost = cost;
+  }
+  return best;
+}
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
 // CTAs that share a tile run at the same time.
@@ -384,16 +402,19 @@ __global__ void __launch_bounds__(kThreads, 1)
 
   int const n_tiles = p.N / kBlockN;
   int const k_tiles = p.K / kBlockK;
-  // The first item's M block does not depend on the routing length, so its
-  // expert id is loaded alongside num_tokens_post_padded rather than after.
-  Item const first = decode_item(blockIdx.x, n_tiles, p.splits, k_tiles);
-  int const first_expert = p.expert_ids[first.m_block];
-  int const num_items =
-      (*p.num_tokens_post_padded / kRows) * n_tiles * p.splits;
+  // Every CTA derives the same split count from the routing length, so the
+  // last wave of items is spread evenly without a host round trip.
+  int const tiles = (*p.num_tokens_post_padded / kRows) * n_tiles;
+  int const splits =
+      p.split_fixed > 0 ? p.split_fixed
+                        : choose_splits(tiles, k_tiles, gridDim.x, p.split_max);
+  int const num_items = tiles * splits;
+  Item const first = decode_item(blockIdx.x, n_tiles, splits, k_tiles);
+  int const first_expert =
+      int(blockIdx.x) < num_items ? p.expert_ids[first.m_block] : -1;
   auto expert_of = [&](int i) {
     return i < num_items
-               ? p.expert_ids[decode_item(i, n_tiles, p.splits, k_tiles)
-                                  .m_block]
+               ? p.expert_ids[decode_item(i, n_tiles, splits, k_tiles).m_block]
                : -1;
   };
 
@@ -423,6 +444,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (tr && threadIdx.x == 0) {
     trc[0] = t_entry;
     trc[1] = gtime();
+    trc[16] = splits;
   }
 
   // Every role walks the same items and the same ring of stages; a stage
@@ -435,7 +457,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       long long t_first = 0, t_last = 0, c_wait = 0;
       int expert_next = first_expert;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-        Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+        Item const it = decode_item(i, n_tiles, splits, k_tiles);
         int const expert = expert_next;
         expert_next = expert_of(i + gridDim.x);
         if (expert < 0) continue;
@@ -482,13 +504,13 @@ __global__ void __launch_bounds__(kThreads, 1)
                            ? p.sorted_token_ids[first_row]
                            : p.num_valid_tokens;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-      Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+      Item const it = decode_item(i, n_tiles, splits, k_tiles);
       int const expert = expert_next;
       int32_t const sid = sid_next;
       int const i_next = i + gridDim.x;
       expert_next = expert_of(i_next);
       if (i_next < num_items)
-        sid_next = p.sorted_token_ids[decode_item(i_next, n_tiles, p.splits,
+        sid_next = p.sorted_token_ids[decode_item(i_next, n_tiles, splits,
                                                   k_tiles)
                                               .m_block *
                                           kRows +
@@ -544,14 +566,14 @@ __global__ void __launch_bounds__(kThreads, 1)
                               ? p.sorted_token_ids[first_row8]
                               : p.num_valid_tokens;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-        Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+        Item const it = decode_item(i, n_tiles, splits, k_tiles);
         int const expert = expert_next;
         int32_t const sid8 = sid8_next;
         int const i_next = i + gridDim.x;
         expert_next = expert_of(i_next);
         if (i_next < num_items)
           sid8_next = p.sorted_token_ids
-              [decode_item(i_next, n_tiles, p.splits, k_tiles).m_block * kRows +
+              [decode_item(i_next, n_tiles, splits, k_tiles).m_block * kRows +
                8];
         if (expert < 0) continue;
         // At most 8 real rows: every M group of the descriptor reads group 0.
@@ -621,7 +643,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     uint32_t phase = 0;
     int expert_next = first_expert;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-      Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+      Item const it = decode_item(i, n_tiles, splits, k_tiles);
       int const expert = expert_next;
       expert_next = expert_of(i + gridDim.x);
       if (expert < 0) continue;
@@ -655,7 +677,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int local = 0;
     long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
-      Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+      Item const it = decode_item(i, n_tiles, splits, k_tiles);
       int32_t const sid = row < kRows
                               ? p.sorted_token_ids[it.m_block * kRows + row]
                               : p.num_valid_tokens;
@@ -675,7 +697,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       float const w = (p.topk_weights != nullptr && valid)
                           ? p.topk_weights[sid]
                           : 1.0f;
-      bool const direct = p.splits == 1;
+      bool const direct = splits == 1;
       long long const c0 = tr ? clock64() : 0;
       mbar_wait(&acc_full_bar, local & 1);
       if (tr) c_acc += clock64() - c0;
@@ -721,7 +743,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       epilogue_bar();
       int32_t* counter = p.counters + it.m_block * n_tiles + it.n_tile;
       if (threadIdx.x == kFirstEpilogueWarp * 32)
-        last_split = atomicAdd(counter, 1) == p.splits - 1;
+        last_split = atomicAdd(counter, 1) == splits - 1;
       epilogue_bar();
       if (!last_split) continue;
       __threadfence();
@@ -739,13 +761,13 @@ __global__ void __launch_bounds__(kThreads, 1)
           float4 parts[kMaxSplits];
 #pragma unroll
           for (int sp = 0; sp < kMaxSplits; ++sp)
-            if (sp < p.splits)
+            if (sp < splits)
               parts[sp] = __ldcg(reinterpret_cast<float4 const*>(
                   p.partials + sp * split_stride + off));
           float acc[4] = {parts[0].x, parts[0].y, parts[0].z, parts[0].w};
 #pragma unroll
           for (int sp = 1; sp < kMaxSplits; ++sp)
-            if (sp < p.splits) {
+            if (sp < splits) {
               acc[0] += parts[sp].x, acc[1] += parts[sp].y;
               acc[2] += parts[sp].z, acc[3] += parts[sp].w;
             }
@@ -821,7 +843,7 @@ inline void print_trace(long long const* d_trace, int ctas,
     return [&, s](int c) { return at(c, s) / ghz(c) * 1e-3; };
   };
   std::fprintf(stderr,
-               "lut_b_stream trace: N=%lld K=%lld splits=%lld ctas=%d span "
+               "lut_b_stream trace: N=%lld K=%lld split_max=%lld ctas=%d span "
                "%.3f us (first entry to last exit)\n",
                (long long)N, (long long)K, (long long)splits, ctas,
                (tend - t0) * 1e-3);
@@ -836,6 +858,7 @@ inline void print_trace(long long const* d_trace, int ctas,
   stats("exit", rel(7));
   stats("steps", [&](int c) { return double(at(c, 12)); });
   stats("items", [&](int c) { return double(at(c, 13)); });
+  stats("splits (device)", [&](int c) { return double(at(c, 16)); });
   stats("sm GHz", ghz);
   stats("producer wait empty us", cyc(11));
   stats("mma wait full us", cyc(9));
@@ -925,19 +948,19 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   int64_t const k_tiles = K / kBlockK;
   int64_t const sms = properties->multiProcessorCount;
 
-  // Split K only when there are too few (M block, N tile) pairs to give every
-  // SM a weight stream. Each routed row is in some block, so there are at
-  // most min(rows, experts) blocks with real rows at small M.
-  int64_t splits = split_k;
-  if (splits <= 0) {
-    int64_t const blocks =
-        std::max<int64_t>(1, std::min<int64_t>(rows, b.size(0)));
-    splits = 1;
-    while (blocks * n_tiles * splits * 2 <= sms && splits * 2 <= k_tiles)
-      splits *= 2;
-  }
-  splits = std::min<int64_t>({std::max<int64_t>(splits, 1), k_tiles,
-                              int64_t(kMaxSplits)});
+  // The kernel picks the K split from the routing length (split_k <= 0);
+  // the host only bounds it, keeping the FP32 partials under 64 MB.
+  int64_t const partial_split_bytes = rows * N * int64_t(sizeof(float));
+  int64_t const split_fixed =
+      split_k > 0 ? std::min<int64_t>({split_k, k_tiles, int64_t(kMaxSplits)})
+                  : 0;
+  int64_t const splits =
+      split_fixed > 0
+          ? split_fixed
+          : std::max<int64_t>(
+                1, std::min<int64_t>({k_tiles, int64_t(kMaxSplits),
+                                      (int64_t(64) << 20) /
+                                          partial_split_bytes}));
 
   float* partials = nullptr;
   std::optional<torch::stable::Tensor> partials_buf;
@@ -968,7 +991,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.top_k = static_cast<int>(top_k);
   params.N = static_cast<int>(N);
   params.K = static_cast<int>(K);
-  params.splits = static_cast<int>(splits);
+  params.split_fixed = static_cast<int>(split_fixed);
+  params.split_max = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
   params.trace = nullptr;
