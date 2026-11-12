@@ -94,7 +94,7 @@ def main() -> None:
     p.add_argument("--peak-tbs", type=float, default=19.2)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--copies", type=int, default=0, help="0: enough for 1 GB")
-    p.add_argument("--split-k", default="0", help="list; 0 = auto")
+    p.add_argument("--split-k", default="0", help="list; 0 = no split")
     args = p.parse_args()
     run, timer_name = timer()
     torch.manual_seed(0)

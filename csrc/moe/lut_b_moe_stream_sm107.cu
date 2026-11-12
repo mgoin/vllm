@@ -20,8 +20,8 @@
 //    and point every M group of the descriptor at it (SBO = 0), so A costs
 //    1 KB of shared memory per K128, and all four epilogue warps can drain
 //    the accumulator (each lane quarter holds the same rows).
-//  * Split-K with an in-kernel reduction when there are too few (M block,
-//    N tile) pairs to occupy every SM: each split writes FP32 partials, and
+//  * Optional split-K (off by default) with an in-kernel reduction: each
+//    split writes FP32 partials, and
 //    the last split to finish a tile (per-tile counter) sums them and writes
 //    the output. Counters are reset by the kernel, so they stay zero between
 //    launches.
@@ -824,17 +824,11 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   int64_t const k_tiles = K / kBlockK;
   int64_t const sms = properties->multiProcessorCount;
 
-  // Split K only when there are too few (M block, N tile) pairs to give every
-  // SM a weight stream. Each routed row is in some block, so there are at
-  // most min(rows, experts) blocks with real rows at small M.
-  int64_t splits = split_k;
-  if (splits <= 0) {
-    int64_t const blocks =
-        std::max<int64_t>(1, std::min<int64_t>(rows, b.size(0)));
-    splits = 1;
-    while (blocks * n_tiles * splits * 2 <= sms && splits * 2 <= k_tiles)
-      splits *= 2;
-  }
+  // split_k <= 0 means no split. Each extra split adds a partials store, a
+  // fence, an atomic and a reduction per item (~4 us), which cost more than
+  // the extra weight streams gained at every decode size measured (5-15%
+  // slower at 1-2 tokens on the GLM-4.7-Flash expert shapes).
+  int64_t splits = split_k <= 0 ? 1 : split_k;
   splits = std::min<int64_t>({std::max<int64_t>(splits, 1), k_tiles,
                               int64_t(kMaxSplits)});
 

@@ -2279,11 +2279,11 @@ def lut_b_moe_gemm_stream(
     Same operands and result, but routing is aligned to blocks of 32 rows
     (`moe_align_block_size(topk_ids, 32, ...)`) and `b` is in the paired
     layout from `lut_b_sm107_pair_tiles` (N a multiple of 256). `split_k`
-    <= 0 picks the K split from the problem size. The kernel keeps the
-    split-K tile counters zero, so one buffer per device is reused. The
-    automatic split only splits when there are at most one tile per two SMs,
-    so 4096 counters always suffice for it and the buffer never grows during
-    CUDA graph capture.
+    <= 0 means no K split, which measured fastest at every decode size; a
+    larger value forces that many K splits. The kernel keeps the split-K
+    tile counters zero, so one buffer per device is reused, and without a
+    split it is never read, so the buffer never grows during CUDA graph
+    capture.
     """
     needed = 4096
     if split_k > 0:
