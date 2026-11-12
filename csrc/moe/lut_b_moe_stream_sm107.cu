@@ -13,8 +13,9 @@
 //    rows are never stored.
 //  * Warp-specialized: lane 0 of warp 0 streams weights with cp.async.bulk,
 //    lane 0 of warp 1 issues MMAs, warp 2 stages the few real activation rows
-//    with cp.async, and warps 3-6 run the epilogue, all through a deep
-//    shared-memory ring.
+//    with cp.async, warps 3-6 run the epilogue and warps 7-10 write each
+//    stage's scales and codebooks into its own TMEM slot (tcgen05.st), all
+//    through a deep shared-memory ring.
 //  * N = 256 MMAs. A M128 x N128 x K128 LUT-B step with MXFP8 A from shared
 //    memory takes about 184 clocks because the 16 KB A read dominates; at
 //    N = 256 the same A read feeds twice the columns and the step is
@@ -67,11 +68,12 @@ constexpr int kMmaWarp = 1;       // MMAs (lane 0)
 constexpr int kALoaderWarp = 2;   // activations
 constexpr int kFirstEpilogueWarp = 3;
 constexpr int kEpilogueThreads = 128;
-// EXPERIMENT: four more warps that can load weights with cp.async (LSU path)
-// instead of, or alongside, the bulk copy (VLLM_LUT_B_STREAM_WLOAD).
-constexpr int kFirstWLoadWarp = kFirstEpilogueWarp + kEpilogueThreads / 32;
-constexpr int kWLoadThreads = 128;
-constexpr int kThreads = 96 + kEpilogueThreads + kWLoadThreads;
+// Four warps (one per TMEM lane quarter) write each stage's scales and
+// codebooks into its own TMEM metadata slot with tcgen05.st, so neither the
+// MMA thread nor the epilogue waits on metadata.
+constexpr int kFirstMetaWarp = kFirstEpilogueWarp + kEpilogueThreads / 32;
+constexpr int kMetaThreads = 128;
+constexpr int kThreads = 96 + kEpilogueThreads + kMetaThreads;
 
 // Global weight tile (one 128 x 128 block).
 constexpr int kTileIdxBytes = kTileN * kBlockK * 3 / 8;  // 6144
@@ -107,12 +109,13 @@ struct Config {
   static_assert(kStages >= 4);
 };
 
-// TMEM: 256 accumulator columns, then A scales, B scales (N256 = 8 columns)
-// and codebooks.
+// TMEM: 256 accumulator columns, then one 16-column metadata slot per stage:
+// A scales (4 columns), B scales (N256 = 8 columns), codebooks (4 columns).
 constexpr int kTmemCols = 512;
-constexpr int kTmemAScale = kBlockN;
-constexpr int kTmemBScale = kBlockN + 4;
-constexpr int kTmemBook = kBlockN + 12;
+constexpr int kMetaCols = 16;
+constexpr int kMetaAScale = 0;
+constexpr int kMetaBScale = 4;
+constexpr int kMetaBook = 12;
 
 constexpr int kMaxSplits = 16;
 
@@ -189,7 +192,8 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 __device__ __forceinline__ long long gtime() {
   unsigned long long t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  // The memory clobber keeps the read from moving across barriers.
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)::"memory");
   return static_cast<long long>(t);
 }
 
@@ -259,6 +263,19 @@ __device__ __forceinline__ void tmem_ld32(uint32_t addr, uint32_t (&v)[32]) {
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
+// Write 16 columns of this warp's lane quarter; returns once written.
+__device__ __forceinline__ void tmem_st16(uint32_t addr, uint4 const (&v)[4]) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,"
+      "%9,%10,%11,%12,%13,%14,%15,%16};" ::"r"(addr),
+      "r"(v[0].x), "r"(v[0].y), "r"(v[0].z), "r"(v[0].w), "r"(v[1].x),
+      "r"(v[1].y), "r"(v[1].z), "r"(v[1].w), "r"(v[2].x), "r"(v[2].y),
+      "r"(v[2].z), "r"(v[2].w), "r"(v[3].x), "r"(v[3].y), "r"(v[3].z),
+      "r"(v[3].w)
+      : "memory");
+  asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+}
+
 __device__ __forceinline__ void epilogue_bar() {
   asm volatile("bar.sync 1, %0;" ::"n"(kEpilogueThreads) : "memory");
 }
@@ -301,11 +318,13 @@ struct Params {
   int K;
   int splits;
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
-  // wrong: 1 copies TMEM metadata only on an item's first K step, 2 skips
-  // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
-  // skips the epilogue's TMEM loads and stores.
+  // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
+  // activation loads, 16 skips the epilogue's TMEM loads and stores, 32
+  // issues every MMA pair twice, 64 drops the per-step fence.proxy.async.
   int debug;
-  int wload;  // EXPERIMENT: 0 bulk, 1 cp.async, 2 half bulk / half cp.async
+  // EXPERIMENT (VLLM_LUT_B_STREAM_META): 1 metadata by tcgen05.st from the
+  // metadata warps (default), 0 by tcgen05.cp from the MMA thread.
+  int meta_st;
   // TEMPORARY (VLLM_LUT_B_STREAM_TRACE): kTraceSlots timestamps per CTA.
   long long* trace;
 };
@@ -335,12 +354,14 @@ __global__ void __launch_bounds__(kThreads, 1)
     lut_b_moe_stream_kernel(Params const p) {
   using Cfg = Config<kAGroups>;
   constexpr int kStages = Cfg::kStages;
+  static_assert(kBlockN + kStages * kMetaCols <= kTmemCols);
 
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   __shared__ __align__(8) uint64_t full_bar[kStages];
   __shared__ __align__(8) uint64_t empty_bar[kStages];
+  __shared__ __align__(8) uint64_t meta_bar[kStages];
   __shared__ __align__(8) uint64_t acc_full_bar;
   __shared__ __align__(8) uint64_t acc_empty_bar;
   __shared__ uint32_t tmem_base;
@@ -364,8 +385,9 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (threadIdx.x == 0) {
     for (int s = 0; s < kStages; ++s) {
       // One expect_tx arrival plus one cp.async arrival per A-loader lane.
-      mbar_init(&full_bar[s], 1 + 32 + kWLoadThreads);
+      mbar_init(&full_bar[s], 1 + 32);
       mbar_init(&empty_bar[s], 1);
+      mbar_init(&meta_bar[s], kMetaThreads);
     }
     mbar_init(&acc_full_bar, 1);
     mbar_init(&acc_empty_bar, kEpilogueThreads);
@@ -413,18 +435,8 @@ __global__ void __launch_bounds__(kThreads, 1)
           uint64_t* bar = &full_bar[stage];
           uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
           uint8_t const* rec = src + int64_t(k) * kBStageBytes;
-          if (p.wload == 0) {
-            mbar_arrive_expect_tx(bar, kBStageBytes);
-            bulk_copy(dst, rec, kBStageBytes, bar);
-          } else if (p.wload == 2) {
-            // Index half 0 plus scales and books by bulk, half 1 by cp.async.
-            mbar_arrive_expect_tx(bar, kBStageBytes - kTileIdxBytes);
-            bulk_copy(dst, rec, kTileIdxBytes, bar);
-            bulk_copy(dst + kBScaleOff, rec + kBScaleOff,
-                      kBStageBytes - kBScaleOff, bar);
-          } else {
-            mbar_arrive(bar);
-          }
+          mbar_arrive_expect_tx(bar, kBStageBytes);
+          bulk_copy(dst, rec, kBStageBytes, bar);
         }
       }
       if (tr) {
@@ -498,7 +510,9 @@ __global__ void __launch_bounds__(kThreads, 1)
         for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
           int const stage = step % kStages;
           c0 = clock64();
-          mbar_wait(&full_bar[stage], (step / kStages) & 1);
+          // Metadata warps arrive after the stage lands (and, with
+          // tcgen05.st, after filling its slot), so this covers both.
+          mbar_wait(&meta_bar[stage], (step / kStages) & 1);
           c_full += clock64() - c0;
           if (tr) {
             t_last = gtime();
@@ -506,17 +520,19 @@ __global__ void __launch_bounds__(kThreads, 1)
           }
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
-          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          if (!(p.debug & 64))
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           uint8_t* st = smem + stage * Cfg::kStageBytes;
           uint8_t* b_st = st + Cfg::kBOff;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          if (!(p.debug & 1) || k == it.k_begin) {
-            copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
-            copy_meta(tmem + kTmemBScale, b_st + kBScaleOff);
-            copy_meta(tmem + kTmemBScale + 4,
+          uint32_t const meta = tmem + kBlockN + stage * kMetaCols;
+          if (!p.meta_st) {
+            copy_meta(meta + kMetaAScale, st + Cfg::kAScaleOff);
+            copy_meta(meta + kMetaBScale, b_st + kBScaleOff);
+            copy_meta(meta + kMetaBScale + 4,
                       b_st + kBScaleOff + kTileScaleBytes);
-            copy_meta(tmem + kTmemBook, b_st + kBBookOff);
+            copy_meta(meta + kMetaBook, b_st + kBBookOff);
           }
           uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
           uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
@@ -524,12 +540,13 @@ __global__ void __launch_bounds__(kThreads, 1)
           // second K64 half of each row.
           uint64_t const b_lo = smem_desc(b_st + kBIdxOff, 128, 384);
           uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
-          if (!(p.debug & 4)) {
-            mma_lut_fill(tmem, a_lo, b_lo, tmem + kTmemBook, idesc,
-                         tmem + kTmemAScale, tmem + kTmemBScale,
-                         k != it.k_begin);
-            mma_lut_lastuse(tmem, a_hi, b_hi, tmem + kTmemBook + 2, idesc_hi,
-                            tmem + kTmemAScale, tmem + kTmemBScale);
+          int const reps = (p.debug & 4) ? 0 : (p.debug & 32) ? 2 : 1;
+          for (int r = 0; r < reps; ++r) {
+            mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
+                         meta + kMetaAScale, meta + kMetaBScale,
+                         r > 0 || k != it.k_begin);
+            mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
+                            meta + kMetaAScale, meta + kMetaBScale);
           }
           tc_commit(&empty_bar[stage]);
         }
@@ -546,28 +563,31 @@ __global__ void __launch_bounds__(kThreads, 1)
       }
     }
     __syncwarp();
-  } else if (warp >= kFirstWLoadWarp) {
-    // ------------------------------------------- weights over cp.async (exp)
-    int const t = threadIdx.x - kFirstWLoadWarp * 32;
-    int const chunk_begin = p.wload == 2 ? kTileIdxBytes / 16 : 0;
-    int const chunk_end = p.wload == 2   ? 2 * kTileIdxBytes / 16
-                          : p.wload == 1 ? kBStageBytes / 16
-                                         : 0;
+  } else if (warp >= kFirstMetaWarp) {
+    // -------------------------------------------------- TMEM metadata slots
+    // Each warp writes its lane quarter, which gives the replication across
+    // all four quarters that tcgen05.cp.32x128b.warpx4 would.
+    uint32_t const lane_base = tmem + (uint32_t((warp % 4) * 32) << 16);
     int step = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      int const expert = p.expert_ids[it.m_block];
-      if (expert < 0) continue;
-      uint8_t const* src = p.b + (int64_t(expert) * n_tiles + it.n_tile) *
-                                     k_tiles * kBStageBytes;
+      if (p.expert_ids[it.m_block] < 0) continue;
       for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
         int const stage = step % kStages;
-        mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
-        uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
-        uint8_t const* rec = src + int64_t(k) * kBStageBytes;
-        for (int c = chunk_begin + t; c < chunk_end; c += kWLoadThreads)
-          cp_async_16(dst + c * 16, rec + c * 16, true);
-        cp_async_arrive(&full_bar[stage]);
+        mbar_wait(&full_bar[stage], (step / kStages) & 1);
+        if (p.meta_st) {
+          uint8_t const* st = smem + stage * Cfg::kStageBytes;
+          uint8_t const* b_st = st + Cfg::kBOff;
+          uint4 v[4];
+          v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff)[lane];
+          v[1] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff)[lane];
+          v[2] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff +
+                                                kTileScaleBytes)[lane];
+          v[3] = reinterpret_cast<uint4 const*>(b_st + kBBookOff)[lane];
+          tmem_st16(lane_base + kBlockN + stage * kMetaCols, v);
+          tc_fence_before();
+        }
+        mbar_arrive(&meta_bar[stage]);
       }
     }
   } else {
@@ -691,7 +711,7 @@ __global__ void __launch_bounds__(kThreads, 1)
 
   tc_fence_before();
   __syncthreads();
-  if (tr && threadIdx.x == 0) {
+  if (tr && warp == kMmaWarp && lane == 0) {
     trc[7] = gtime();
     trc[15] = clock64() - c_entry;
   }
@@ -890,8 +910,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.splits = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
-  char const* wload_env = std::getenv("VLLM_LUT_B_STREAM_WLOAD");
-  params.wload = wload_env ? std::atoi(wload_env) : 0;
+  char const* meta_env = std::getenv("VLLM_LUT_B_STREAM_META");
+  params.meta_st = meta_env ? std::atoi(meta_env) : 1;
   params.trace = nullptr;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
