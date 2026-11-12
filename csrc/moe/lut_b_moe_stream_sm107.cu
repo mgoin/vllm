@@ -517,10 +517,21 @@ __global__ void __launch_bounds__(kThreads, 1)
             cp_async_16(a_st + (row / 8) * 1024 + (row % 8) * 16 + chunk * 128,
                         src, t >= 0);
           }
-          // A scales: row r's four K32 scales land in lane r of the block.
-          if (lane < groups * 8)
-            cp_async_4(st + Cfg::kAScaleOff + r * kAScaleBytes + lane * 16,
+          // A scales: the MMA reads accumulator row R's scale word from
+          // record R % 32, word R / 32. Token row 8j + i sits in accumulator
+          // row 32j + i (SBO 256), so its word goes to record i, word j; a
+          // small block (SBO 0) repeats rows 0-7 in all four words.
+          uint8_t* as_st = st + Cfg::kAScaleOff + r * kAScaleBytes;
+          if (groups == 1) {
+            int32_t const ti = __shfl_sync(0xffffffffu, token, lane / 4);
+            cp_async_4(as_st + (lane / 4) * 16 + (lane % 4) * 4,
+                       p.a_scales + int64_t(max(ti, 0)) * (p.K / 32) +
+                           (k + r) * 4,
+                       ti >= 0);
+          } else if (groups > 1 && lane < groups * 8) {
+            cp_async_4(as_st + (lane % 8) * 16 + (lane / 8) * 4,
                        s_row + (k + r) * 4, token >= 0);
+          }
         }
         cp_async_arrive(&full_bar[stage]);
         if (++stage == kStages) stage = 0, phase ^= 1;
@@ -554,8 +565,11 @@ __global__ void __launch_bounds__(kThreads, 1)
               [decode_item(i_next, n_tiles, p.splits, k_tiles).m_block * kRows +
                8];
         if (expert < 0) continue;
-        // At most 8 real rows: every M group of the descriptor reads group 0.
-        int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 1024;
+        // A holds token groups (8 rows) 1 KB apart. SBO 256 places token
+        // group j in M group 4j, i.e. TMEM lanes 32j..32j+7, so all four
+        // epilogue warps drain rows. With at most 8 real rows, SBO 0 points
+        // every M group at group 0 and each lane quarter holds rows 0-7.
+        int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 256;
 
         long long c0 = tr ? clock64() : 0;
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
@@ -649,28 +663,38 @@ __global__ void __launch_bounds__(kThreads, 1)
   } else {
     // ------------------------------------------------------------- epilogue
     int const quarter = warp % 4;  // TMEM lanes this warp may access
-    int const row = quarter * 32 + lane;
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
     int local = 0;
     long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      int32_t const sid = row < kRows
-                              ? p.sorted_token_ids[it.m_block * kRows + row]
-                              : p.num_valid_tokens;
-      bool const valid = sid < p.num_valid_tokens;
+      int32_t const* const blk = p.sorted_token_ids + it.m_block * kRows;
       int64_t const col0 = int64_t(it.n_tile) * kBlockN;
+      // Issue all three loads before choosing between them.
+      int32_t const sid_lane = blk[lane];
+      int32_t const sid_group = blk[(quarter * 8 + lane) % kRows];
+      bool const small = blk[8] >= p.num_valid_tokens;
 
       if (p.expert_ids[it.m_block] < 0) {
         // Tokens routed to an expert that is not local to this rank.
-        if (valid && it.split == 0) {
-          uint4* dst = reinterpret_cast<uint4*>(c + sid * int64_t(p.N) + col0);
+        if (quarter == 0 && sid_lane < p.num_valid_tokens && it.split == 0) {
+          uint4* dst =
+              reinterpret_cast<uint4*>(c + sid_lane * int64_t(p.N) + col0);
           for (int j = 0; j < kBlockN * int(sizeof(OutT)) / 16; ++j)
             dst[j] = make_uint4(0, 0, 0, 0);
         }
         continue;
       }
+
+      // Lanes 0-7 of this quarter hold token rows 8 * quarter + lane, or
+      // rows 0-7 of a small block, whose columns the quarters then split.
+      int const t = small ? lane : quarter * 8 + lane;
+      int32_t const sid = lane >= 8          ? p.num_valid_tokens
+                          : small ? sid_lane : sid_group;
+      bool const valid = sid < p.num_valid_tokens;
+      int const n_begin = small ? quarter * (kBlockN / 4) : 0;
+      int const n_end = small ? n_begin + kBlockN / 4 : kBlockN;
 
       float const w = (p.topk_weights != nullptr && valid)
                           ? p.topk_weights[sid]
@@ -682,7 +706,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       tc_fence_after();
       if (!(p.debug & 16) && __any_sync(0xffffffffu, valid)) {
 #pragma unroll 1
-        for (int n = 0; n < kBlockN; n += 32) {
+        for (int n = n_begin; n < n_end; n += 32) {
           uint32_t v[32];
           tmem_ld32(lane_addr + n, v);
           if (valid) {
@@ -713,10 +737,14 @@ __global__ void __launch_bounds__(kThreads, 1)
 
       // Split-K: the last split to finish this tile sums the partials.
       // Real rows are a prefix of the block, so count them per warp.
+      // epi_* only hold real rows: the reduction reads rows [0, rows).
       int const warp_rows = __popc(__ballot_sync(0xffffffffu, valid));
-      if (lane == 0) epi_rows[quarter] = warp_rows;
-      epi_sid[row] = sid;
-      epi_weight[row] = w;
+      // Small blocks repeat rows 0-7 in every quarter; count them once.
+      if (lane == 0) epi_rows[quarter] = small && quarter > 0 ? 0 : warp_rows;
+      if (valid) {
+        epi_sid[t] = sid;
+        epi_weight[t] = w;
+      }
       __threadfence();
       epilogue_bar();
       int32_t* counter = p.counters + it.m_block * n_tiles + it.n_tile;
