@@ -288,8 +288,10 @@ struct Params {
   int N;
   int K;
   int splits;
-  // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG): 2 skips the
-  // split-K reduction, 8 skips activation loads. Results are wrong.
+  // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
+  // wrong: 1 copies TMEM metadata only on an item's first K step, 2 skips
+  // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
+  // skips the epilogue's TMEM loads and stores.
   int debug;
 };
 
@@ -465,21 +467,26 @@ __global__ void __launch_bounds__(kThreads, 1)
           uint8_t* b_st = st + Cfg::kBOff;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
-          copy_meta(tmem + kTmemBScale, b_st + kBScaleOff);
-          copy_meta(tmem + kTmemBScale + 4, b_st + kBScaleOff + kTileScaleBytes);
-          copy_meta(tmem + kTmemBook, b_st + kBBookOff);
+          if (!(p.debug & 1) || k == it.k_begin) {
+            copy_meta(tmem + kTmemAScale, st + Cfg::kAScaleOff);
+            copy_meta(tmem + kTmemBScale, b_st + kBScaleOff);
+            copy_meta(tmem + kTmemBScale + 4,
+                      b_st + kBScaleOff + kTileScaleBytes);
+            copy_meta(tmem + kTmemBook, b_st + kBBookOff);
+          }
           uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
           uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
           // Compressed B rows are 48 bytes; descriptor bit 53 selects the
           // second K64 half of each row.
           uint64_t const b_lo = smem_desc(b_st + kBIdxOff, 128, 384);
           uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
-          mma_lut_fill(tmem, a_lo, b_lo, tmem + kTmemBook, idesc,
-                       tmem + kTmemAScale, tmem + kTmemBScale,
-                       k != it.k_begin);
-          mma_lut_lastuse(tmem, a_hi, b_hi, tmem + kTmemBook + 2, idesc_hi,
-                          tmem + kTmemAScale, tmem + kTmemBScale);
+          if (!(p.debug & 4)) {
+            mma_lut_fill(tmem, a_lo, b_lo, tmem + kTmemBook, idesc,
+                         tmem + kTmemAScale, tmem + kTmemBScale,
+                         k != it.k_begin);
+            mma_lut_lastuse(tmem, a_hi, b_hi, tmem + kTmemBook + 2, idesc_hi,
+                            tmem + kTmemAScale, tmem + kTmemBScale);
+          }
           tc_commit(&empty_bar[stage]);
         }
         tc_commit(&acc_full_bar);
@@ -518,7 +525,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       bool const direct = p.splits == 1;
       mbar_wait(&acc_full_bar, local & 1);
       tc_fence_after();
-      if (__any_sync(0xffffffffu, valid)) {
+      if (!(p.debug & 16) && __any_sync(0xffffffffu, valid)) {
 #pragma unroll 1
         for (int n = 0; n < kBlockN; n += 32) {
           uint32_t v[32];
@@ -696,7 +703,7 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
     int64_t const blocks =
         std::max<int64_t>(1, std::min<int64_t>(rows, b.size(0)));
     splits = 1;
-    while (blocks * n_tiles * splits < sms && splits * 2 <= k_tiles)
+    while (blocks * n_tiles * splits * 2 <= sms && splits * 2 <= k_tiles)
       splits *= 2;
   }
   splits = std::min<int64_t>({std::max<int64_t>(splits, 1), k_tiles,
