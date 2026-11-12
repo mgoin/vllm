@@ -2259,6 +2259,47 @@ def lut_b_moe_gemm(
     )
 
 
+_lut_b_split_counters: dict[torch.device, torch.Tensor] = {}
+
+
+def lut_b_moe_gemm_stream(
+    a: torch.Tensor,
+    a_scales: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    split_k: int = 0,
+) -> None:
+    """Weight-streaming variant of `lut_b_moe_gemm` for small M.
+
+    Same operands and result. Needs N to be a multiple of 256. `split_k`
+    <= 0 picks the K split from the problem size. The split-K tile counters
+    are kept zero by the kernel, so one buffer per device is reused.
+    """
+    needed = expert_ids.size(0) * (c.size(1) // 256)
+    counters = _lut_b_split_counters.get(c.device)
+    if counters is None or counters.numel() < needed:
+        counters = torch.zeros(max(needed, 4096), dtype=torch.int32, device=c.device)
+        _lut_b_split_counters[c.device] = counters
+    torch.ops._moe_C.lut_b_moe_gemm_stream(
+        a,
+        a_scales,
+        b,
+        c,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        counters,
+        split_k,
+    )
+
+
 def fp32_router_gemm(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,

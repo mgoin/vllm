@@ -268,3 +268,88 @@ def test_sm107_gemm_exact(workspace_init) -> None:
     torch.testing.assert_close(
         out.view(num_tokens, top_k, n).double(), ref, rtol=1e-2, atol=1e-2
     )
+
+
+def _gemm_problem(num_tokens: int, num_experts: int, top_k: int, n: int, k: int):
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+        mxfp8_e4m3_quantize,
+    )
+
+    a = torch.randn(num_tokens, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(num_experts, n, k, device="cuda")
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda")
+    q = quantize_lut_b(w)
+    a_q, a_s = mxfp8_e4m3_quantize(a)
+    routing = moe_align_block_size(topk_ids, 128, num_experts)
+    a_ref = dequant_mxfp8_to_bf16(a_q, a_s.view(num_tokens, -1)).float()
+    ref = (
+        torch.einsum(
+            "tk,tjnk->tjn",
+            a_ref.double(),
+            _dequantize(q, torch.float32).double()[topk_ids.long()],
+        )
+        * topk_weights[..., None].double()
+    )
+    return a_q, a_s.view(num_tokens, -1), lut_b_to_sm107_tiles(*q), topk_weights, routing, ref
+
+
+@requires_sm107
+@pytest.mark.parametrize("num_tokens", [1, 2, 5, 33, 200])
+@pytest.mark.parametrize("split_k", [0, 1, 3])
+@pytest.mark.parametrize("n,k", [(256, 384), (512, 1024)])
+def test_sm107_stream_gemm_exact(
+    workspace_init, num_tokens: int, split_k: int, n: int, k: int
+) -> None:
+    """The weight-streaming kernel against an FP32 reference."""
+    torch.manual_seed(4)
+    num_experts, top_k = 6, 4
+    a_q, a_s, tiles, topk_weights, routing, ref = _gemm_problem(
+        num_tokens, num_experts, top_k, n, k
+    )
+    sorted_ids, expert_ids, num_post_pad = routing
+    out = torch.full((num_tokens * top_k, n), float("nan"), device="cuda").bfloat16()
+    for _ in range(2):  # the second run checks that split counters were reset
+        out.fill_(float("nan"))
+        ops.lut_b_moe_gemm_stream(
+            a_q,
+            a_s,
+            tiles,
+            out,
+            topk_weights.flatten(),
+            sorted_ids,
+            expert_ids,
+            num_post_pad,
+            top_k,
+            split_k,
+        )
+        torch.testing.assert_close(
+            out.view(num_tokens, top_k, n).double(), ref, rtol=1e-2, atol=1e-2
+        )
+
+
+@requires_sm107
+@pytest.mark.parametrize("num_tokens", [1, 3, 64])
+def test_sm107_stream_matches_simple_kernel(workspace_init, num_tokens: int) -> None:
+    """Without split-K both kernels sum each K128 step in the same order."""
+    torch.manual_seed(5)
+    num_experts, top_k, n, k = 8, 4, 512, 512
+    a_q, a_s, tiles, topk_weights, routing, _ = _gemm_problem(
+        num_tokens, num_experts, top_k, n, k
+    )
+    outs = []
+    for stream in (False, True):
+        out = torch.empty((num_tokens * top_k, n), device="cuda").bfloat16()
+        args = (a_q, a_s, tiles, out, topk_weights.flatten(), *routing, top_k)
+        if stream:
+            ops.lut_b_moe_gemm_stream(*args, split_k=1)
+        else:
+            ops.lut_b_moe_gemm(*args)
+        outs.append(out)
+    torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)

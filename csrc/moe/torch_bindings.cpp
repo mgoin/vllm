@@ -99,6 +99,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "lut_b_moe_gemm(Tensor a, Tensor a_scales, Tensor b, Tensor! c, "
       "Tensor? topk_weights, Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, int top_k) -> ()");
+  // Weight-streaming variant for small M (persistent, N256, split-K).
+  m.def(
+      "lut_b_moe_gemm_stream(Tensor a, Tensor a_scales, Tensor b, Tensor! c, "
+      "Tensor? topk_weights, Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, int top_k, Tensor! split_counters, "
+      "int split_k) -> ()");
   #endif
 
   m.def(
@@ -184,6 +190,7 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
   #ifdef VLLM_ENABLE_LUT_B_MOE
   m.impl("lut_b_moe_gemm", TORCH_BOX(&lut_b_moe_gemm));
+  m.impl("lut_b_moe_gemm_stream", TORCH_BOX(&lut_b_moe_gemm_stream));
   #endif
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));

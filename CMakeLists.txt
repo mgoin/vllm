@@ -1434,7 +1434,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     cuda_archs_loose_intersection(LUT_B_MOE_ARCHS "10.7f" "${CUDA_ARCHS}")
   endif()
   if(LUT_B_MOE_ARCHS)
-    set(LUT_B_MOE_SRC "csrc/moe/lut_b_moe_sm107.cu")
+    set(LUT_B_MOE_SRC "csrc/moe/lut_b_moe_sm107.cu"
+                      "csrc/moe/lut_b_moe_stream_sm107.cu")
     set_gencode_flags_for_srcs(
       SRCS "${LUT_B_MOE_SRC}"
       CUDA_ARCHS "${LUT_B_MOE_ARCHS}")

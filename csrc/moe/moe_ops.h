@@ -113,4 +113,15 @@ void lut_b_moe_gemm(torch::stable::Tensor const& a,
                     torch::stable::Tensor const& expert_ids,
                     torch::stable::Tensor const& num_tokens_post_padded,
                     int64_t top_k);
+
+void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
+                           torch::stable::Tensor const& a_scales,
+                           torch::stable::Tensor const& b,
+                           torch::stable::Tensor& c,
+                           std::optional<torch::stable::Tensor> topk_weights,
+                           torch::stable::Tensor const& sorted_token_ids,
+                           torch::stable::Tensor const& expert_ids,
+                           torch::stable::Tensor const& num_tokens_post_padded,
+                           int64_t top_k, torch::stable::Tensor& split_counters,
+                           int64_t split_k);
 #endif
