@@ -96,6 +96,7 @@ constexpr int kTmemBScale = kBlockN + 4;
 constexpr int kTmemBook = kBlockN + 12;
 
 constexpr int kExpectTxBytes = kBStageBytes;
+constexpr int kMaxSplits = 16;
 
 __device__ __forceinline__ uint32_t smem_addr(void const* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -313,6 +314,9 @@ __global__ void __launch_bounds__(kThreads, 1)
   __shared__ int32_t producer_rows[kBlockM];
   __shared__ uint32_t tmem_base;
   __shared__ int last_split;
+  __shared__ int32_t epi_sid[kBlockM];
+  __shared__ float epi_weight[kBlockM];
+  __shared__ int epi_rows[4];
 
   int const warp = threadIdx.x / 32;
   int const lane = threadIdx.x % 32;
@@ -535,6 +539,11 @@ __global__ void __launch_bounds__(kThreads, 1)
       if (direct || (p.debug & 2)) continue;
 
       // Split-K: the last split to finish this tile sums the partials.
+      // Real rows are a prefix of the block, so count them per warp.
+      int const warp_rows = __popc(__ballot_sync(0xffffffffu, valid));
+      if (lane == 0) epi_rows[quarter] = warp_rows;
+      epi_sid[row] = sid;
+      epi_weight[row] = w;
       __threadfence();
       epilogue_bar();
       int32_t* counter = p.counters + it.m_block * n_tiles + it.n_tile;
@@ -543,28 +552,38 @@ __global__ void __launch_bounds__(kThreads, 1)
       epilogue_bar();
       if (!last_split) continue;
       __threadfence();
-      if (valid) {
-        float const* src =
-            p.partials + int64_t(sid) * p.N + col0;  // split 0
+      {
+        // Spread the tile over all epilogue threads and issue every split's
+        // load before summing, so the reduction costs one L2 round trip.
+        int const rows =
+            epi_rows[0] + epi_rows[1] + epi_rows[2] + epi_rows[3];
+        int const et = threadIdx.x - kFirstEpilogueWarp * 32;
         int64_t const split_stride = int64_t(p.num_valid_tokens) * p.N;
-        OutT* dst = c + sid * int64_t(p.N) + col0;
-#pragma unroll 1
-        for (int n = 0; n < kBlockN; n += 8) {
-          float acc[8];
-          float4 lo = __ldcg(reinterpret_cast<float4 const*>(src + n));
-          float4 hi = __ldcg(reinterpret_cast<float4 const*>(src + n + 4));
-          acc[0] = lo.x, acc[1] = lo.y, acc[2] = lo.z, acc[3] = lo.w;
-          acc[4] = hi.x, acc[5] = hi.y, acc[6] = hi.z, acc[7] = hi.w;
-          for (int s = 1; s < p.splits; ++s) {
-            float const* ps = src + s * split_stride + n;
-            lo = __ldcg(reinterpret_cast<float4 const*>(ps));
-            hi = __ldcg(reinterpret_cast<float4 const*>(ps + 4));
-            acc[0] += lo.x, acc[1] += lo.y, acc[2] += lo.z, acc[3] += lo.w;
-            acc[4] += hi.x, acc[5] += hi.y, acc[6] += hi.z, acc[7] += hi.w;
-          }
-          store8<OutT>(dst + n, acc, w);
+        constexpr int kVecs = kBlockN / 4;
+        for (int v = et; v < rows * kVecs; v += kEpilogueThreads) {
+          int const r = v / kVecs, col = (v % kVecs) * 4;
+          int64_t const off = int64_t(epi_sid[r]) * p.N + col0 + col;
+          float4 parts[kMaxSplits];
+#pragma unroll
+          for (int sp = 0; sp < kMaxSplits; ++sp)
+            if (sp < p.splits)
+              parts[sp] = __ldcg(reinterpret_cast<float4 const*>(
+                  p.partials + sp * split_stride + off));
+          float acc[4] = {parts[0].x, parts[0].y, parts[0].z, parts[0].w};
+#pragma unroll
+          for (int sp = 1; sp < kMaxSplits; ++sp)
+            if (sp < p.splits) {
+              acc[0] += parts[sp].x, acc[1] += parts[sp].y;
+              acc[2] += parts[sp].z, acc[3] += parts[sp].w;
+            }
+          float const wr = epi_weight[r];
+          uint2 packed;
+          packed.x = pack2<OutT>(acc[0] * wr, acc[1] * wr);
+          packed.y = pack2<OutT>(acc[2] * wr, acc[3] * wr);
+          *reinterpret_cast<uint2*>(c + off) = packed;
         }
       }
+      epilogue_bar();  // epi_* are rewritten for the next item
       if (threadIdx.x == kFirstEpilogueWarp * 32) *counter = 0;
     }
   }
@@ -669,7 +688,8 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
     while (blocks * n_tiles * splits < sms && splits * 2 <= k_tiles)
       splits *= 2;
   }
-  splits = std::min<int64_t>(std::max<int64_t>(splits, 1), k_tiles);
+  splits = std::min<int64_t>({std::max<int64_t>(splits, 1), k_tiles,
+                              int64_t(kMaxSplits)});
 
   float* partials = nullptr;
   std::optional<torch::stable::Tensor> partials_buf;
