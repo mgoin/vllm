@@ -12,6 +12,7 @@ activation and output bytes, divided by kernel time.
 """
 
 import argparse
+import os
 import statistics
 
 import torch
@@ -87,6 +88,9 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--copies", type=int, default=0, help="0: enough for 1 GB")
     p.add_argument("--split-k", default="0", help="list; 0 = auto")
+    p.add_argument("--trace", action="store_true",
+                   help="after timing, run each stream variant once more "
+                   "(cold L2) with VLLM_LUT_B_STREAM_TRACE=1")
     args = p.parse_args()
     run, timer_name = timer()
     torch.manual_seed(0)
@@ -132,7 +136,18 @@ def main() -> None:
                 us = run(fn, args.iters)
                 tbs = total / us / 1e6
                 print(f"{n}x{k},{m},{hit},{sk},{name},{us:.2f},"
-                      f"{wbytes / 1e6:.1f},{tbs:.2f},{100 * tbs / args.peak_tbs:.1f}")
+                      f"{wbytes / 1e6:.1f},{tbs:.2f},{100 * tbs / args.peak_tbs:.1f}",
+                      flush=True)
+                if args.trace and name == "stream":
+                    flush = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
+                    os.environ["VLLM_LUT_B_STREAM_TRACE"] = "1"
+                    for _ in range(2):
+                        flush.zero_()
+                        torch.cuda.synchronize()
+                        fn()
+                        torch.cuda.synchronize()
+                    del os.environ["VLLM_LUT_B_STREAM_TRACE"]
+                    del flush
         del tiles
 
 

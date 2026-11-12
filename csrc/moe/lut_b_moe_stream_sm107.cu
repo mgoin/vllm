@@ -41,6 +41,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
+#include <vector>
 #include <optional>
 #include <type_traits>
 
@@ -185,6 +187,12 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
       : "memory");
 }
 
+__device__ __forceinline__ long long gtime() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return static_cast<long long>(t);
+}
+
 __device__ __forceinline__ void tc_fence_after() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
@@ -298,7 +306,11 @@ struct Params {
   // skips the epilogue's TMEM loads and stores.
   int debug;
   int wload;  // EXPERIMENT: 0 bulk, 1 cp.async, 2 half bulk / half cp.async
+  // TEMPORARY (VLLM_LUT_B_STREAM_TRACE): kTraceSlots timestamps per CTA.
+  long long* trace;
 };
+
+constexpr int kTraceSlots = 16;
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
 // CTAs that share a tile run at the same time.
@@ -339,6 +351,10 @@ __global__ void __launch_bounds__(kThreads, 1)
 
   int const warp = threadIdx.x / 32;
   int const lane = threadIdx.x % 32;
+  bool const tr = p.trace != nullptr;
+  long long* const trc = tr ? p.trace + blockIdx.x * kTraceSlots : nullptr;
+  long long const t_entry = tr ? gtime() : 0;
+  long long const c_entry = clock64();
 
   int const n_tiles = p.N / kBlockN;
   int const k_tiles = p.K / kBlockK;
@@ -366,22 +382,34 @@ __global__ void __launch_bounds__(kThreads, 1)
   __syncthreads();
   tc_fence_after();
   uint32_t const tmem = tmem_base;
+  if (tr && threadIdx.x == 0) {
+    trc[0] = t_entry;
+    trc[1] = gtime();
+  }
 
   if (warp == kProducerWarp) {
     // -------------------------------------------------------------- weights
     if (lane == 0) {
-      int step = 0;
+      int step = 0, items = 0;
+      long long t_first = 0, t_last = 0, c_wait = 0;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
         Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
         int const expert = p.expert_ids[it.m_block];
         if (expert < 0) continue;
+        ++items;
         // The paired tile is already the stage's weight image.
         uint8_t const* src =
             p.b + (int64_t(expert) * n_tiles + it.n_tile) * k_tiles *
                       kBStageBytes;
         for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
           int const stage = step % kStages;
+          long long const c0 = clock64();
           mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+          c_wait += clock64() - c0;
+          if (tr) {
+            t_last = gtime();
+            if (step == 0) t_first = t_last;
+          }
           uint64_t* bar = &full_bar[stage];
           uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
           uint8_t const* rec = src + int64_t(k) * kBStageBytes;
@@ -398,6 +426,13 @@ __global__ void __launch_bounds__(kThreads, 1)
             mbar_arrive(bar);
           }
         }
+      }
+      if (tr) {
+        trc[2] = t_first;
+        trc[8] = t_last;
+        trc[11] = c_wait;
+        trc[12] = step;
+        trc[13] = items;
       }
     }
     __syncwarp();
@@ -447,6 +482,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       // The second K64 half uses scale byte 2 of each 4-byte A/B scale word.
       uint32_t const idesc_hi = idesc | (2u << 29) | (2u << 4);
       int step = 0, local = 0;
+      long long t_first = 0, t_last = 0, t_commit = 0, c_full = 0, c_acc = 0;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
         Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
         if (p.expert_ids[it.m_block] < 0) continue;
@@ -455,11 +491,19 @@ __global__ void __launch_bounds__(kThreads, 1)
             p.sorted_token_ids[it.m_block * kRows + 8] >= p.num_valid_tokens;
         int const a_sbo = small ? 0 : 1024;
 
+        long long c0 = clock64();
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
+        c_acc += clock64() - c0;
         tc_fence_after();
         for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
           int const stage = step % kStages;
+          c0 = clock64();
           mbar_wait(&full_bar[stage], (step / kStages) & 1);
+          c_full += clock64() - c0;
+          if (tr) {
+            t_last = gtime();
+            if (step == 0) t_first = t_last;
+          }
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -490,7 +534,15 @@ __global__ void __launch_bounds__(kThreads, 1)
           tc_commit(&empty_bar[stage]);
         }
         tc_commit(&acc_full_bar);
+        if (tr) t_commit = gtime();
         ++local;
+      }
+      if (tr) {
+        trc[3] = t_first;
+        trc[4] = t_last;
+        trc[5] = t_commit;
+        trc[9] = c_full;
+        trc[10] = c_acc;
       }
     }
     __syncwarp();
@@ -525,6 +577,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
     int local = 0;
+    long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
       int32_t const sid = row < kRows
@@ -547,7 +600,9 @@ __global__ void __launch_bounds__(kThreads, 1)
                           ? p.topk_weights[sid]
                           : 1.0f;
       bool const direct = p.splits == 1;
+      long long const c0 = clock64();
       mbar_wait(&acc_full_bar, local & 1);
+      c_acc += clock64() - c0;
       tc_fence_after();
       if (!(p.debug & 16) && __any_sync(0xffffffffu, valid)) {
 #pragma unroll 1
@@ -628,10 +683,18 @@ __global__ void __launch_bounds__(kThreads, 1)
       epilogue_bar();  // epi_* are rewritten for the next item
       if (threadIdx.x == kFirstEpilogueWarp * 32) *counter = 0;
     }
+    if (tr && quarter == 0 && lane == 0) {
+      trc[6] = gtime();
+      trc[14] = c_acc;
+    }
   }
 
   tc_fence_before();
   __syncthreads();
+  if (tr && threadIdx.x == 0) {
+    trc[7] = gtime();
+    trc[15] = clock64() - c_entry;
+  }
   if (warp == kMmaWarp) {
     tc_fence_after();
     asm volatile(
@@ -641,6 +704,69 @@ __global__ void __launch_bounds__(kThreads, 1)
         "n"(kTmemCols)
         : "memory");
   }
+}
+
+// TEMPORARY: summarize VLLM_LUT_B_STREAM_TRACE timestamps on stderr.
+// Times are microseconds after the earliest CTA entry; waits are per-CTA
+// microseconds at the CTA's own measured SM clock.
+inline void print_trace(long long const* d_trace, int ctas,
+                        cudaStream_t stream, int64_t splits, int64_t N,
+                        int64_t K) {
+  std::vector<long long> t(size_t(ctas) * kTraceSlots);
+  cudaStreamSynchronize(stream);
+  cudaMemcpy(t.data(), d_trace, t.size() * sizeof(long long),
+             cudaMemcpyDeviceToHost);
+  auto at = [&](int c, int s) { return t[size_t(c) * kTraceSlots + s]; };
+  long long t0 = at(0, 0), tend = at(0, 7);
+  for (int c = 0; c < ctas; ++c) {
+    t0 = std::min(t0, at(c, 0));
+    tend = std::max(tend, at(c, 7));
+  }
+  auto stats = [&](char const* name, auto f) {
+    std::vector<double> v;
+    for (int c = 0; c < ctas; ++c) v.push_back(f(c));
+    std::sort(v.begin(), v.end());
+    std::fprintf(stderr, "  %-26s min %8.3f  p10 %8.3f  p50 %8.3f  p90 %8.3f  max %8.3f\n",
+                 name, v.front(), v[v.size() / 10], v[v.size() / 2],
+                 v[v.size() * 9 / 10], v.back());
+  };
+  auto rel = [&](int s) {
+    return [&, s](int c) { return at(c, s) ? (at(c, s) - t0) * 1e-3 : -1.0; };
+  };
+  // ns per cycle for CTA c
+  auto ghz = [&](int c) {
+    return double(at(c, 15)) / std::max<long long>(1, at(c, 7) - at(c, 0));
+  };
+  auto cyc = [&](int s) {
+    return [&, s](int c) { return at(c, s) / ghz(c) * 1e-3; };
+  };
+  std::fprintf(stderr,
+               "lut_b_stream trace: N=%lld K=%lld splits=%lld ctas=%d span "
+               "%.3f us (first entry to last exit)\n",
+               (long long)N, (long long)K, (long long)splits, ctas,
+               (tend - t0) * 1e-3);
+  stats("entry", rel(0));
+  stats("prologue done", rel(1));
+  stats("producer first issue", rel(2));
+  stats("mma first full", rel(3));
+  stats("producer last issue", rel(8));
+  stats("mma last full", rel(4));
+  stats("mma last acc commit", rel(5));
+  stats("epilogue done", rel(6));
+  stats("exit", rel(7));
+  stats("steps", [&](int c) { return double(at(c, 12)); });
+  stats("items", [&](int c) { return double(at(c, 13)); });
+  stats("sm GHz", ghz);
+  stats("producer wait empty us", cyc(11));
+  stats("mma wait full us", cyc(9));
+  stats("mma wait acc_empty us", cyc(10));
+  stats("epi wait acc_full us", cyc(14));
+  stats("steady GB/s (1st..last)", [&](int c) {
+    long long const dt = at(c, 4) - at(c, 3);
+    return at(c, 12) > 1 && dt > 0
+               ? double(at(c, 12) - 1) * kBStageBytes / dt
+               : 0.0;
+  });
 }
 
 }  // namespace lut_b_moe_stream
@@ -766,10 +892,21 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.debug = debug_env ? std::atoi(debug_env) : 0;
   char const* wload_env = std::getenv("VLLM_LUT_B_STREAM_WLOAD");
   params.wload = wload_env ? std::atoi(wload_env) : 0;
+  params.trace = nullptr;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
   cudaStream_t const stream = get_current_cuda_stream(device);
+  char const* trace_env = std::getenv("VLLM_LUT_B_STREAM_TRACE");
+  std::optional<torch::stable::Tensor> trace_buf;
+  if (trace_env && std::atoi(trace_env) != 0) {
+    trace_buf = torch::stable::empty({int64_t(grid.x) * kTraceSlots},
+                                     ScalarType::Long, std::nullopt,
+                                     a.device());
+    params.trace = reinterpret_cast<long long*>(trace_buf->mutable_data_ptr());
+    cudaMemsetAsync(params.trace, 0, sizeof(long long) * grid.x * kTraceSlots,
+                    stream);
+  }
 
   auto launch = [&](auto* out, auto groups) {
     using OutT = std::remove_pointer_t<decltype(out)>;
@@ -800,4 +937,6 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   cudaError_t const err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess, "lut_b_moe_gemm_stream launch failed: ",
                   cudaGetErrorString(err));
+  if (params.trace != nullptr) print_trace(params.trace, grid.x, stream,
+                                           splits, N, K);
 }
