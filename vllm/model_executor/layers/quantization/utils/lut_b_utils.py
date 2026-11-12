@@ -279,3 +279,29 @@ def lut_b_to_sm107_tiles(
     book_bytes = books.permute(0, 1, 3, 2, 4, 5).reshape(num_experts, nt, kt, 256)
 
     return torch.cat((index_bytes, scale_bytes, book_bytes), dim=-1).contiguous()
+
+
+LUT_B_SM107_PAIR_TILE_BYTES = 2 * LUT_B_SM107_TILE_BYTES
+
+
+def lut_b_sm107_pair_tiles(tiles: torch.Tensor) -> torch.Tensor:
+    """Pair N-adjacent SM107 tiles for the weight-streaming MoE kernel.
+
+    Takes `[E, N / 128, K / 128, 6912]` from `lut_b_to_sm107_tiles` and
+    returns `[E, N / 256, K / 128, 13824]`: for each 256 x 128 block, the
+    indices, scales and codebooks of its two halves, each part back to back,
+    so one copy fills an N256 stage.
+    """
+    num_experts, nt, kt, _ = tiles.shape
+    if nt % 2:
+        raise ValueError(f"pairing SM107 tiles needs N divisible by 256, got {nt * 128}")
+    halves = tiles.view(num_experts, nt // 2, 2, kt, LUT_B_SM107_TILE_BYTES)
+    halves = halves.transpose(2, 3)  # [E, N / 256, K / 128, 2, 6912]
+    parts = (
+        halves[..., :6144],
+        halves[..., 6144:6656],
+        halves[..., 6656:],
+    )
+    return torch.cat(
+        [part.flatten(-2) for part in parts], dim=-1
+    ).contiguous()

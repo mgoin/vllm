@@ -20,11 +20,15 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
+    lut_b_sm107_pair_tiles,
+)
 
 TILE_BYTES = 6912
 
 
 def make_tiles(experts: int, n: int, k: int, copies: int) -> list[torch.Tensor]:
+    """Random tiles with unit scales and finite codebooks, in both layouts."""
     out = []
     for _ in range(copies):
         t = torch.randint(
@@ -33,7 +37,7 @@ def make_tiles(experts: int, n: int, k: int, copies: int) -> list[torch.Tensor]:
         )
         t[..., 6144:6656] = 127  # unit UE8M0 scales
         t[..., 6656:] &= 0x77  # finite E4M3 codebook entries
-        out.append(t)
+        out.append((t, lut_b_sm107_pair_tiles(t)))
     return out
 
 
@@ -92,7 +96,7 @@ def main() -> None:
     for shape in args.shapes.split(","):
         n, k = map(int, shape.split("x"))
         per_copy = args.experts * n * k * TILE_BYTES // (128 * 128)
-        copies = args.copies or max(2, (1 << 30) // per_copy + 1)
+        copies = args.copies or max(2, (1 << 30) // (2 * per_copy) + 1)
         tiles = make_tiles(args.experts, n, k, copies)
         for m in map(int, args.tokens.split(",")):
             topk_ids = torch.stack(
@@ -111,14 +115,14 @@ def main() -> None:
             state = {"i": 0}
 
             def simple():
-                t = tiles[state["i"] % copies]
+                t = tiles[state["i"] % copies][0]
                 state["i"] += 1
                 ops.lut_b_moe_gemm(a, a_s, t, c, topk_w, *routing, args.top_k)
 
             variants = [("simple", 1, simple)]
             for sk in map(int, args.split_k.split(",")):
                 def stream(sk=sk):
-                    t = tiles[state["i"] % copies]
+                    t = tiles[state["i"] % copies][1]
                     state["i"] += 1
                     ops.lut_b_moe_gemm_stream(
                         a, a_s, t, c, topk_w, *routing32, args.top_k, split_k=sk

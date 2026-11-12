@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.experts.lut_b_moe import (
 from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
     LUT_B_PACKED_TILE_BYTES,
     dequantize_lut_b,
+    lut_b_sm107_pair_tiles,
     lut_b_to_sm107_tiles,
     pack_lut_b_indices,
     quantize_lut_b,
@@ -116,6 +117,23 @@ def test_sm107_tile_layout() -> None:
     assert tiles.shape == (1, 1, 2, 6912)
     expected = dequantize_lut_b(packed, codebooks, scales, torch.float32)
     torch.testing.assert_close(_decode_sm107_tiles(tiles), expected, rtol=0, atol=0)
+
+
+def test_sm107_pair_tiles() -> None:
+    tiles = torch.randint(0, 256, (2, 4, 3, 6912), dtype=torch.uint8)
+    paired = lut_b_sm107_pair_tiles(tiles)
+    assert paired.shape == (2, 2, 3, 13824)
+    for half in range(2):
+        tile = tiles[:, half::2]
+        assert torch.equal(paired[..., half * 6144 : (half + 1) * 6144], tile[..., :6144])
+        assert torch.equal(
+            paired[..., 12288 + half * 512 : 12288 + (half + 1) * 512],
+            tile[..., 6144:6656],
+        )
+        assert torch.equal(
+            paired[..., 13312 + half * 256 : 13312 + (half + 1) * 256],
+            tile[..., 6656:],
+        )
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -316,6 +334,7 @@ def test_sm107_stream_gemm_exact(
     a_q, a_s, tiles, topk_weights, _, routing, ref = _gemm_problem(
         num_tokens, num_experts, top_k, n, k, 32
     )
+    tiles = lut_b_sm107_pair_tiles(tiles)
     sorted_ids, expert_ids, num_post_pad = routing
     out = torch.full((num_tokens * top_k, n), float("nan"), device="cuda").bfloat16()
     for _ in range(2):  # the second run checks that split counters were reset
@@ -356,6 +375,7 @@ def test_sm107_stream_matches_simple_kernel(workspace_init, num_tokens: int) -> 
         args = (a_q, a_s, tiles, out, topk_weights.flatten())
         if stream:
             routing = moe_align_block_size(topk_ids, 32, num_experts)
+            args = (a_q, a_s, lut_b_sm107_pair_tiles(tiles), out, args[-1])
             ops.lut_b_moe_gemm_stream(*args, *routing, top_k, split_k=1)
         else:
             ops.lut_b_moe_gemm(*args, *routing, top_k)

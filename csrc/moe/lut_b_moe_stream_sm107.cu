@@ -28,10 +28,12 @@
 //    the output. Counters are reset by the kernel, so they stay zero between
 //    launches.
 //
-// Global weight layout per (expert, 128 N, 128 K) tile, as lut_b_moe_sm107.cu:
-//   [6144 B packed indices][512 B B scales][256 B codebooks]
-// Two N-adjacent tiles form one N256 stage in shared memory:
-//   [idx 0][idx 1][scales 0][scales 1][books 0][books 1]  (13824 B)
+// Weights use the paired SM107 layout from `lut_b_sm107_pair_tiles`: per
+// (expert, 256 N, 128 K) one 13824 B record that is the stage image,
+//   [idx 0][idx 1][scales 0][scales 1][books 0][books 1]
+// where 0 and 1 are the two 128-column halves in the lut_b_moe_sm107.cu tile
+// format. Each K step is a single cp.async.bulk: the bulk path's cost is per
+// request, and splitting a stage into six copies cost about 20%.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -106,7 +108,6 @@ constexpr int kTmemAScale = kBlockN;
 constexpr int kTmemBScale = kBlockN + 4;
 constexpr int kTmemBook = kBlockN + 12;
 
-constexpr int kExpectTxBytes = kBStageBytes;
 constexpr int kMaxSplits = 16;
 
 __device__ __forceinline__ uint32_t smem_addr(void const* p) {
@@ -144,26 +145,12 @@ __device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
 }
 
 __device__ __forceinline__ void bulk_copy(void* dst, void const* src,
-                                          int bytes, uint64_t* bar,
-                                          uint64_t policy, bool hint) {
-  if (hint)
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes."
-        "L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(smem_addr(dst)),
-        "l"(src), "r"(bytes), "r"(smem_addr(bar)), "l"(policy)
-        : "memory");
-  else
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
-        "[%0], [%1], %2, [%3];" ::"r"(smem_addr(dst)),
-        "l"(src), "r"(bytes), "r"(smem_addr(bar))
-        : "memory");
-}
-
-__device__ __forceinline__ void prefetch_l2(void const* src, int bytes) {
-  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src),
-               "r"(bytes)
-               : "memory");
+                                          int bytes, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1], %2, [%3];" ::"r"(smem_addr(dst)),
+      "l"(src), "r"(bytes), "r"(smem_addr(bar))
+      : "memory");
 }
 
 __device__ __forceinline__ void mbar_init(uint64_t* bar, int count) {
@@ -301,12 +288,10 @@ struct Params {
   int N;
   int K;
   int splits;
-  int prefetch;  // K steps of weights to prefetch into L2 ahead of the ring
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
   // wrong: 1 copies TMEM metadata only on an item's first K step, 2 skips
   // the split-K reduction, 4 skips the MMAs, 8 skips activation loads, 16
-  // skips the epilogue's TMEM loads and stores, 32 copies only the packed
-  // indices, 64 drops the L2 evict_first hint on weight loads.
+  // skips the epilogue's TMEM loads and stores.
   int debug;
 };
 
@@ -327,58 +312,6 @@ __device__ __forceinline__ Item decode_item(int i, int n_tiles, int splits,
   it.k_end = (it.split + 1) * k_tiles / splits;
   return it;
 }
-
-// Walks this CTA's (item, K step) sequence for the weight producer, skipping
-// items whose expert is not local.
-struct Cursor {
-  int32_t const* expert_ids;
-  uint8_t const* b;
-  int tiles_n, splits, i, num_items, n_tiles, k_tiles, k, k_end;
-  uint8_t const* b0;
-
-  __device__ Cursor(Params const& p, int num_items_, int n_tiles_,
-                    int k_tiles_)
-      : expert_ids(p.expert_ids),
-        b(p.b),
-        tiles_n(p.N / kTileN),
-        splits(p.splits),
-        i(int(blockIdx.x) - int(gridDim.x)),
-        num_items(num_items_),
-        n_tiles(n_tiles_),
-        k_tiles(k_tiles_),
-        k(0),
-        k_end(0),
-        b0(nullptr) {
-    next_item();
-  }
-
-  __device__ void next_item() {
-    for (i += gridDim.x; i < num_items; i += gridDim.x) {
-      Item const it = decode_item(i, n_tiles, splits, k_tiles);
-      int const expert = expert_ids[it.m_block];
-      if (expert < 0) continue;
-      b0 = b + (int64_t(expert) * tiles_n + 2 * it.n_tile) * k_tiles *
-                   kTileBytes;
-      k = it.k_begin;
-      k_end = it.k_end;
-      if (k < k_end) return;
-    }
-  }
-  __device__ bool valid() const { return i < num_items; }
-  __device__ void advance() {
-    if (++k >= k_end) next_item();
-  }
-  __device__ uint8_t const* tile0() const {
-    return b0 + int64_t(k) * kTileBytes;
-  }
-  __device__ uint8_t const* tile1() const {
-    return b0 + int64_t(k_tiles + k) * kTileBytes;
-  }
-  __device__ void prefetch() const {
-    prefetch_l2(tile0(), kTileBytes);
-    prefetch_l2(tile1(), kTileBytes);
-  }
-};
 
 template <typename OutT, int kAGroups>
 __global__ void __launch_bounds__(kThreads, 1)
@@ -432,45 +365,22 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (warp == kProducerWarp) {
     // -------------------------------------------------------------- weights
     if (lane == 0) {
-      uint64_t policy;
-      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
-                   : "=l"(policy));
-      bool const hint = !(p.debug & 64);
-      bool const books = !(p.debug & 32);
-      // A second cursor runs `prefetch` K steps ahead and pulls those weight
-      // tiles into L2, so the shared-memory ring refills from L2 instead of
-      // waiting a full HBM round trip per stage.
-      Cursor load(p, num_items, n_tiles, k_tiles);
-      Cursor ahead = load;
-      for (int d = 0; d < p.prefetch && ahead.valid(); ++d) {
-        ahead.prefetch();
-        ahead.advance();
-      }
-      for (int step = 0; load.valid(); ++step, load.advance()) {
-        if (ahead.valid()) {
-          ahead.prefetch();
-          ahead.advance();
-        }
-        int const stage = step % kStages;
-        mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
-        uint8_t* st = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
-        uint64_t* bar = &full_bar[stage];
-        mbar_arrive_expect_tx(bar, books ? kExpectTxBytes : 2 * kTileIdxBytes);
-        uint8_t const* t0 = load.tile0();
-        uint8_t const* t1 = load.tile1();
-        bulk_copy(st + kBIdxOff, t0, kTileIdxBytes, bar, policy, hint);
-        bulk_copy(st + kBIdxOff + kTileIdxBytes, t1, kTileIdxBytes, bar,
-                  policy, hint);
-        if (books) {
-          bulk_copy(st + kBScaleOff, t0 + kTileIdxBytes, kTileScaleBytes, bar,
-                    policy, hint);
-          bulk_copy(st + kBScaleOff + kTileScaleBytes, t1 + kTileIdxBytes,
-                    kTileScaleBytes, bar, policy, hint);
-          bulk_copy(st + kBBookOff, t0 + kTileIdxBytes + kTileScaleBytes,
-                    kTileBookBytes, bar, policy, hint);
-          bulk_copy(st + kBBookOff + kTileBookBytes,
-                    t1 + kTileIdxBytes + kTileScaleBytes, kTileBookBytes, bar,
-                    policy, hint);
+      int step = 0;
+      for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
+        Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
+        int const expert = p.expert_ids[it.m_block];
+        if (expert < 0) continue;
+        // The paired tile is already the stage's weight image.
+        uint8_t const* src =
+            p.b + (int64_t(expert) * n_tiles + it.n_tile) * k_tiles *
+                      kBStageBytes;
+        for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
+          int const stage = step % kStages;
+          mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+          uint64_t* bar = &full_bar[stage];
+          mbar_arrive_expect_tx(bar, kBStageBytes);
+          bulk_copy(smem + stage * Cfg::kStageBytes + Cfg::kBOff,
+                    src + int64_t(k) * kBStageBytes, kBStageBytes, bar);
         }
       }
     }
@@ -730,10 +640,10 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
                       a_scales.size(1) == K / 32,
                   "lut_b_moe_gemm_stream: a_scales must be [M, K / 32]");
   STD_TORCH_CHECK(
-      b.dim() == 4 && b.is_contiguous() && b.size(1) == N / kTileN &&
-          b.size(2) == K / kBlockK && b.size(3) == kTileBytes,
-      "lut_b_moe_gemm_stream: b must be [E, N / 128, K / 128, ", kTileBytes,
-      "]");
+      b.dim() == 4 && b.is_contiguous() && b.size(1) == N / kBlockN &&
+          b.size(2) == K / kBlockK && b.size(3) == kBStageBytes,
+      "lut_b_moe_gemm_stream: b must be paired tiles [E, N / 256, K / 128, ",
+      kBStageBytes, "]");
   STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(a.const_data_ptr()) % 16 == 0 &&
                       reinterpret_cast<uintptr_t>(b.const_data_ptr()) % 16 == 0,
                   "lut_b_moe_gemm_stream: a and b must be 16-byte aligned");
@@ -814,8 +724,6 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.splits = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
-  char const* prefetch_env = std::getenv("VLLM_LUT_B_STREAM_PREFETCH");
-  params.prefetch = prefetch_env ? std::atoi(prefetch_env) : 16;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
   dim3 const grid(static_cast<unsigned>(std::min(sms, max_items)));
