@@ -321,8 +321,10 @@ struct Params {
   // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
   // activation loads, 16 skips the epilogue's TMEM loads and stores, 32
   // issues every MMA pair twice, 64 drops the per-step fence.proxy.async.
-  // 128 / 256 batch the per-stage empty commits by 2 / 4 (results stay
-  // correct).
+  // 128 / 256 / 4096 batch the per-stage empty commits by 2 / 4 / 8
+  // (results stay correct). Timing-only: 512 points every MMA at metadata
+  // slot 0, 1024 points every MMA at stage 0's A and B, 2048 makes the MMA
+  // thread wait on full_bar instead of meta_bar.
   int debug;
   // EXPERIMENT (VLLM_LUT_B_STREAM_META): metadata by 0 tcgen05.cp from the
   // MMA thread, 1 tcgen05.st from the metadata warps (default), 2 tcgen05.st
@@ -332,7 +334,7 @@ struct Params {
   long long* trace;
 };
 
-constexpr int kTraceSlots = 16;
+constexpr int kTraceSlots = 20;
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
 // CTAs that share a tile run at the same time.
@@ -498,7 +500,11 @@ __global__ void __launch_bounds__(kThreads, 1)
                              (uint32_t(kBlockM / 16) << 24) | (1u << 31);
       // The second K64 half uses scale byte 2 of each 4-byte A/B scale word.
       uint32_t const idesc_hi = idesc | (2u << 29) | (2u << 4);
-      int const commit_group = (p.debug & 256) ? 4 : (p.debug & 128) ? 2 : 1;
+      int const commit_group = (p.debug & 4096)  ? 8
+                               : (p.debug & 256) ? 4
+                               : (p.debug & 128) ? 2
+                                                 : 1;
+      long long c_fence = 0, c_mma = 0, c_commit = 0;
       int pending = 0;
       int step = 0, local = 0;
       long long t_first = 0, t_last = 0, t_commit = 0, c_full = 0, c_acc = 0;
@@ -519,8 +525,10 @@ __global__ void __launch_bounds__(kThreads, 1)
           c0 = clock64();
           // Metadata warps arrive after the stage lands (and, with
           // tcgen05.st, after filling its slot), so this covers both.
-          mbar_wait(&meta_bar[stage], (step / kStages) & 1);
-          c_full += clock64() - c0;
+          mbar_wait((p.debug & 2048) ? &full_bar[stage] : &meta_bar[stage],
+                    (step / kStages) & 1);
+          long long c1 = clock64();
+          c_full += c1 - c0;
           if (tr) {
             t_last = gtime();
             if (step == 0) t_first = t_last;
@@ -529,11 +537,15 @@ __global__ void __launch_bounds__(kThreads, 1)
           // Activations arrived through cp.async (generic proxy).
           if (!(p.debug & 64))
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-          uint8_t* st = smem + stage * Cfg::kStageBytes;
+          c0 = clock64();
+          c_fence += c0 - c1;
+          int const op_stage = (p.debug & 1024) ? 0 : stage;
+          uint8_t* st = smem + op_stage * Cfg::kStageBytes;
           uint8_t* b_st = st + Cfg::kBOff;
           // Metadata columns are reused every K tile; tcgen05.cp and
           // tcgen05.mma issued by one thread execute in order.
-          uint32_t const meta = tmem + kBlockN + stage * kMetaCols;
+          uint32_t const meta =
+              tmem + kBlockN + ((p.debug & 512) ? 0 : stage) * kMetaCols;
           if (p.meta_st == 0) {
             copy_meta(meta + kMetaAScale, st + Cfg::kAScaleOff);
             copy_meta(meta + kMetaBScale, b_st + kBScaleOff);
@@ -555,6 +567,8 @@ __global__ void __launch_bounds__(kThreads, 1)
             mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
                             meta + kMetaAScale, meta + kMetaBScale);
           }
+          c1 = clock64();
+          c_mma += c1 - c0;
           // Each commit tracks every earlier MMA, so a batch of commits
           // after the newest step frees all of the batch's stages.
           if (++pending == commit_group || k + 1 == it.k_end) {
@@ -562,6 +576,7 @@ __global__ void __launch_bounds__(kThreads, 1)
               tc_commit(&empty_bar[(step - j) % kStages]);
             pending = 0;
           }
+          c_commit += clock64() - c1;
         }
         tc_commit(&acc_full_bar);
         if (tr) t_commit = gtime();
@@ -573,6 +588,9 @@ __global__ void __launch_bounds__(kThreads, 1)
         trc[5] = t_commit;
         trc[9] = c_full;
         trc[10] = c_acc;
+        trc[16] = c_fence;
+        trc[17] = c_mma;
+        trc[18] = c_commit;
       }
     }
     __syncwarp();
@@ -818,6 +836,9 @@ inline void print_trace(long long const* d_trace, int ctas,
   stats("mma wait full us", cyc(9));
   stats("mma wait acc_empty us", cyc(10));
   stats("epi wait acc_full us", cyc(14));
+  stats("mma fences us", cyc(16));
+  stats("mma issue (cp+mma) us", cyc(17));
+  stats("mma commits us", cyc(18));
   stats("steady GB/s (1st..last)", [&](int c) {
     long long const dt = at(c, 4) - at(c, 3);
     return at(c, 12) > 1 && dt > 0
