@@ -500,36 +500,50 @@ __global__ void __launch_bounds__(kThreads, 1)
       int const count = __popc(__ballot_sync(0xffffffffu, valid));
       int groups = count <= 8 ? 1 : kAGroups;
       if (p.debug & 8) groups = 0;
-      uint8_t const* s_row = p.a_scales + int64_t(max(token, 0)) * (p.K / 32);
+
+      // Per item, not per record: each lane copies 16-byte chunk lane % 8
+      // of rows lane / 8 + 4j into the canonical K-major no-swizzle layout
+      // (8-row x 16-byte core matrices, 128 bytes apart along K and 1024
+      // bytes apart along M), so a record costs groups * 2 copies per lane.
+      constexpr int kRowsPerLane = kAGroups * 2;
+      int const chunk = lane % 8;
+      uint8_t const* a_src[kRowsPerLane];
+      int a_dst[kRowsPerLane];
+      bool a_ok[kRowsPerLane];
+#pragma unroll
+      for (int j = 0; j < kRowsPerLane; ++j) {
+        int const r = lane / 8 + 4 * j;
+        int32_t const t = __shfl_sync(0xffffffffu, token, r);
+        a_ok[j] = t >= 0;
+        a_src[j] = p.a + int64_t(max(t, 0)) * p.K + chunk * 16;
+        a_dst[j] = (r / 8) * 1024 + (r % 8) * 16 + chunk * 128;
+      }
+      // A scales: the MMA reads accumulator row R's scale word from record
+      // R % 32, word R / 32. A small block (SBO 0) repeats rows 0-7 in every
+      // lane quarter, so their words fill all four: lane l copies row l / 4
+      // into word l % 4. Otherwise lane r copies row r into word 0.
+      int32_t const s_token =
+          groups == 1 ? __shfl_sync(0xffffffffu, token, lane / 4) : token;
+      bool const s_copy = groups == 1 || (groups > 1 && lane < groups * 8);
+      uint8_t const* const s_src =
+          p.a_scales + int64_t(max(s_token, 0)) * (p.K / 32);
+      int const s_dst = groups == 1 ? (lane / 4) * 16 + (lane % 4) * 4
+                                    : lane * 16;
+
       for (int k = it.k_begin; k < it.k_end; k += kRecs) {
         int const recs = min(kRecs, it.k_end - k);
         mbar_wait(&empty_bar[stage], phase ^ 1);
         uint8_t* st = smem + stage * Cfg::kStageBytes;
         for (int r = 0; r < recs; ++r) {
-          // Canonical K-major no-swizzle layout: 8-row x 16-byte core
-          // matrices, 128 bytes apart along K and 1024 bytes apart along M.
           uint8_t* a_st = st + Cfg::kAOff + r * Cfg::kABytes;
-          for (int c = lane; c < groups * 64; c += 32) {
-            int const row = c / 8, chunk = c % 8;
-            int32_t const t = __shfl_sync(0xffffffffu, token, row);
-            uint8_t const* src =
-                p.a + int64_t(max(t, 0)) * p.K + (k + r) * kBlockK + chunk * 16;
-            cp_async_16(a_st + (row / 8) * 1024 + (row % 8) * 16 + chunk * 128,
-                        src, t >= 0);
-          }
-          // A scales: the MMA reads accumulator row R's scale word from
-          // record R % 32, word R / 32. A small block (SBO 0) repeats rows
-          // 0-7 in every lane quarter, so their words fill all four.
-          uint8_t* as_st = st + Cfg::kAScaleOff + r * kAScaleBytes;
-          if (groups == 1) {
-            int32_t const ti = __shfl_sync(0xffffffffu, token, lane / 4);
-            cp_async_4(as_st + (lane / 4) * 16 + (lane % 4) * 4,
-                       p.a_scales + int64_t(max(ti, 0)) * (p.K / 32) +
-                           (k + r) * 4,
-                       ti >= 0);
-          } else if (groups > 1 && lane < groups * 8) {
-            cp_async_4(as_st + lane * 16, s_row + (k + r) * 4, token >= 0);
-          }
+          int const k_off = (k + r) * kBlockK;
+#pragma unroll
+          for (int j = 0; j < kRowsPerLane; ++j)
+            if (j < groups * 2)
+              cp_async_16(a_st + a_dst[j], a_src[j] + k_off, a_ok[j]);
+          if (s_copy)
+            cp_async_4(st + Cfg::kAScaleOff + r * kAScaleBytes + s_dst,
+                       s_src + (k + r) * 4, s_token >= 0);
         }
         cp_async_arrive(&full_bar[stage]);
         if (++stage == kStages) stage = 0, phase ^= 1;
