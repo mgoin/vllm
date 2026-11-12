@@ -91,26 +91,37 @@ constexpr int kAScaleBytes = 512;
 // Leaves room for static shared memory under the 227 KB per-block limit.
 constexpr int kSmemBudget = 227 * 1024 - 4096;
 
-// Stage: [A, kAGroups 8-row groups x K128][A scales][weights]. A block of up
-// to 32 rows needs 4 A groups; the M128 MMA also reads groups 4-15, which
-// land on the rest of the stage and only feed accumulator rows never stored.
+// K128 records per pipeline stage. Every stage costs the same handful of
+// barrier waits, fences and a commit on each role's loop, which bounded the
+// MMA thread at about 340 ns per stage; two records per stage halve that per
+// byte.
+constexpr int kRecs = 2;
+
+// Stage: [A x kRecs][A scales x kRecs][weights x kRecs], where one A tile is
+// kAGroups 8-row groups x K128. A block of up to 32 rows needs 4 A groups;
+// the M128 MMA also reads groups 4-15, which land on the rest of the stage
+// and only feed accumulator rows that are never stored. The weight records
+// are contiguous so one bulk copy fills them.
 template <int kAGroups>
 struct Config {
   static constexpr int kABytes = kAGroups * 1024;
   static constexpr int kAOff = 0;
-  static constexpr int kAScaleOff = kABytes;
-  static constexpr int kBOff = kAScaleOff + kAScaleBytes;
-  static constexpr int kStageBytes = kBOff + kBStageBytes;
+  static constexpr int kAScaleOff = kRecs * kABytes;
+  static constexpr int kBOff = kAScaleOff + kRecs * kAScaleBytes;
+  static constexpr int kStageBytes =
+      (kBOff + kRecs * kBStageBytes + 1023) / 1024 * 1024;
   static constexpr int kStages = kSmemBudget / kStageBytes;
   static constexpr int kSmemBytes = kStages * kStageBytes + 1024;
-  static_assert(kStageBytes % 128 == 0);
-  static_assert(kAGroups == 1 || kStageBytes >= kBlockM / 8 * 1024);
+  static_assert(kBOff % 16 == 0);
+  static_assert(kAGroups == 1 ||
+                kStageBytes - (kRecs - 1) * kABytes >= kBlockM / 8 * 1024);
   static_assert(kAGroups * 8 <= kRows);
   static_assert(kStages >= 4);
 };
 
-// TMEM: 256 accumulator columns, then one 16-column metadata slot per stage:
-// A scales (4 columns), B scales (N256 = 8 columns), codebooks (4 columns).
+// TMEM: 256 accumulator columns, then one 16-column metadata slot per record
+// of each stage: A scales (4 columns), B scales (N256 = 8 columns),
+// codebooks (4 columns).
 constexpr int kTmemCols = 512;
 constexpr int kMetaCols = 16;
 constexpr int kMetaAScale = 0;
@@ -212,14 +223,6 @@ __device__ __forceinline__ void tc_commit(uint64_t* bar) {
       : "memory");
 }
 
-// Copy a 512-byte uint32[32][4] metadata block into four TMEM columns,
-// replicated across all four 32-lane partitions.
-__device__ __forceinline__ void copy_meta(uint32_t tmem, void const* src) {
-  asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" ::"r"(tmem),
-               "l"(smem_desc(src, 16, 128))
-               : "memory");
-}
-
 __device__ __forceinline__ void mma_lut_fill(uint32_t d, uint64_t a, uint64_t b,
                                              uint32_t book, uint32_t idesc,
                                              uint32_t sfa, uint32_t sfb,
@@ -263,7 +266,8 @@ __device__ __forceinline__ void tmem_ld32(uint32_t addr, uint32_t (&v)[32]) {
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-// Write 16 columns of this warp's lane quarter; returns once written.
+// Write 16 columns of this warp's lane quarter (complete after
+// tmem_wait_st).
 __device__ __forceinline__ void tmem_st16(uint32_t addr, uint4 const (&v)[4]) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,"
@@ -273,6 +277,9 @@ __device__ __forceinline__ void tmem_st16(uint32_t addr, uint4 const (&v)[4]) {
       "r"(v[2].z), "r"(v[2].w), "r"(v[3].x), "r"(v[3].y), "r"(v[3].z),
       "r"(v[3].w)
       : "memory");
+}
+
+__device__ __forceinline__ void tmem_wait_st() {
   asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
@@ -313,28 +320,20 @@ struct Params {
   int32_t const* expert_ids;
   int32_t const* num_tokens_post_padded;
   int num_valid_tokens;
+  int num_sorted;  // sorted_token_ids.size(0)
   int top_k;
   int N;
   int K;
   int splits;
   // TEMPORARY profiling switches (VLLM_LUT_B_STREAM_DEBUG), results are
   // wrong: 2 skips the split-K reduction, 4 skips the MMAs, 8 skips
-  // activation loads, 16 skips the epilogue's TMEM loads and stores, 32
-  // issues every MMA pair twice, 64 drops the per-step fence.proxy.async.
-  // 128 / 256 / 4096 batch the per-stage empty commits by 2 / 4 / 8
-  // (results stay correct). Timing-only: 512 points every MMA at metadata
-  // slot 0, 1024 points every MMA at stage 0's A and B, 2048 makes the MMA
-  // thread wait on full_bar instead of meta_bar.
+  // activation loads, 16 skips the epilogue's TMEM loads and stores.
   int debug;
-  // EXPERIMENT (VLLM_LUT_B_STREAM_META): metadata by 0 tcgen05.cp from the
-  // MMA thread, 1 tcgen05.st from the metadata warps (default), 2 tcgen05.st
-  // from the epilogue warps before each item (launches without warps 7-10).
-  int meta_st;
   // TEMPORARY (VLLM_LUT_B_STREAM_TRACE): kTraceSlots timestamps per CTA.
   long long* trace;
 };
 
-constexpr int kTraceSlots = 20;
+constexpr int kTraceSlots = 16;
 
 // Work item i -> (M block, N256 tile, K split); splits are innermost so the
 // CTAs that share a tile run at the same time.
@@ -359,7 +358,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     lut_b_moe_stream_kernel(Params const p) {
   using Cfg = Config<kAGroups>;
   constexpr int kStages = Cfg::kStages;
-  static_assert(kBlockN + kStages * kMetaCols <= kTmemCols);
+  static_assert(kBlockN + kStages * kRecs * kMetaCols <= kTmemCols);
 
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>(
@@ -381,12 +380,22 @@ __global__ void __launch_bounds__(kThreads, 1)
   bool const tr = p.trace != nullptr;
   long long* const trc = tr ? p.trace + blockIdx.x * kTraceSlots : nullptr;
   long long const t_entry = tr ? gtime() : 0;
-  long long const c_entry = clock64();
+  long long const c_entry = tr ? clock64() : 0;
 
   int const n_tiles = p.N / kBlockN;
   int const k_tiles = p.K / kBlockK;
+  // The first item's M block does not depend on the routing length, so its
+  // expert id is loaded alongside num_tokens_post_padded rather than after.
+  Item const first = decode_item(blockIdx.x, n_tiles, p.splits, k_tiles);
+  int const first_expert = p.expert_ids[first.m_block];
   int const num_items =
       (*p.num_tokens_post_padded / kRows) * n_tiles * p.splits;
+  auto expert_of = [&](int i) {
+    return i < num_items
+               ? p.expert_ids[decode_item(i, n_tiles, p.splits, k_tiles)
+                                  .m_block]
+               : -1;
+  };
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < kStages; ++s) {
@@ -416,79 +425,105 @@ __global__ void __launch_bounds__(kThreads, 1)
     trc[1] = gtime();
   }
 
+  // Every role walks the same items and the same ring of stages; a stage
+  // holds up to kRecs consecutive K128 records of one item.
   if (warp == kProducerWarp) {
     // -------------------------------------------------------------- weights
     if (lane == 0) {
-      int step = 0, items = 0;
+      int stage = 0, steps = 0, items = 0;
+      uint32_t phase = 0;
       long long t_first = 0, t_last = 0, c_wait = 0;
+      int expert_next = first_expert;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
         Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-        int const expert = p.expert_ids[it.m_block];
+        int const expert = expert_next;
+        expert_next = expert_of(i + gridDim.x);
         if (expert < 0) continue;
         ++items;
-        // The paired tile is already the stage's weight image.
+        // Paired records are the stage's weight image and are contiguous
+        // along K, so one bulk copy fills a stage.
         uint8_t const* src =
-            p.b + (int64_t(expert) * n_tiles + it.n_tile) * k_tiles *
+            p.b + ((int64_t(expert) * n_tiles + it.n_tile) * k_tiles +
+                   it.k_begin) *
                       kBStageBytes;
-        for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
-          int const stage = step % kStages;
-          long long const c0 = clock64();
-          mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
-          c_wait += clock64() - c0;
+        for (int k = it.k_begin; k < it.k_end; k += kRecs, ++steps) {
+          int const bytes = min(kRecs, it.k_end - k) * kBStageBytes;
+          long long const c0 = tr ? clock64() : 0;
+          mbar_wait(&empty_bar[stage], phase ^ 1);
           if (tr) {
+            c_wait += clock64() - c0;
             t_last = gtime();
-            if (step == 0) t_first = t_last;
+            if (steps == 0) t_first = t_last;
           }
-          uint64_t* bar = &full_bar[stage];
-          uint8_t* dst = smem + stage * Cfg::kStageBytes + Cfg::kBOff;
-          uint8_t const* rec = src + int64_t(k) * kBStageBytes;
-          mbar_arrive_expect_tx(bar, kBStageBytes);
-          bulk_copy(dst, rec, kBStageBytes, bar);
+          mbar_arrive_expect_tx(&full_bar[stage], bytes);
+          bulk_copy(smem + stage * Cfg::kStageBytes + Cfg::kBOff, src, bytes,
+                    &full_bar[stage]);
+          src += bytes;
+          if (++stage == kStages) stage = 0, phase ^= 1;
         }
       }
       if (tr) {
         trc[2] = t_first;
         trc[8] = t_last;
         trc[11] = c_wait;
-        trc[12] = step;
+        trc[12] = steps;
         trc[13] = items;
       }
     }
     __syncwarp();
   } else if (warp == kALoaderWarp) {
     // ---------------------------------------------------------- activations
-    int step = 0;
+    int stage = 0;
+    uint32_t phase = 0;
+    int expert_next = first_expert;
+    // The first block may be the array's last, partial one.
+    int const first_row = first.m_block * kRows + lane;
+    int32_t sid_next = first_row < p.num_sorted
+                           ? p.sorted_token_ids[first_row]
+                           : p.num_valid_tokens;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      if (p.expert_ids[it.m_block] < 0) continue;
+      int const expert = expert_next;
+      int32_t const sid = sid_next;
+      int const i_next = i + gridDim.x;
+      expert_next = expert_of(i_next);
+      if (i_next < num_items)
+        sid_next = p.sorted_token_ids[decode_item(i_next, n_tiles, p.splits,
+                                                  k_tiles)
+                                              .m_block *
+                                          kRows +
+                                      lane];
+      if (expert < 0) continue;
       // Real rows are a prefix of the block; lane r owns row r.
-      int32_t const sid = p.sorted_token_ids[it.m_block * kRows + lane];
       bool const valid = sid < p.num_valid_tokens;
       int32_t const token = valid ? sid / p.top_k : -1;
       int const count = __popc(__ballot_sync(0xffffffffu, valid));
       int groups = count <= 8 ? 1 : kAGroups;
       if (p.debug & 8) groups = 0;
-      for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
-        int const stage = step % kStages;
-        mbar_wait(&empty_bar[stage], ((step / kStages) & 1) ^ 1);
+      uint8_t const* s_row = p.a_scales + int64_t(max(token, 0)) * (p.K / 32);
+      for (int k = it.k_begin; k < it.k_end; k += kRecs) {
+        int const recs = min(kRecs, it.k_end - k);
+        mbar_wait(&empty_bar[stage], phase ^ 1);
         uint8_t* st = smem + stage * Cfg::kStageBytes;
-        // Canonical K-major no-swizzle layout: 8-row x 16-byte core
-        // matrices, 128 bytes apart along K and 1024 bytes apart along M.
-        for (int c = lane; c < groups * 64; c += 32) {
-          int const r = c / 8, chunk = c % 8;
-          int32_t const row = __shfl_sync(0xffffffffu, token, r);
-          cp_async_16(st + Cfg::kAOff + (r / 8) * 1024 + (r % 8) * 16 +
-                          chunk * 128,
-                      p.a + int64_t(max(row, 0)) * p.K + k * kBlockK +
-                          chunk * 16,
-                      row >= 0);
+        for (int r = 0; r < recs; ++r) {
+          // Canonical K-major no-swizzle layout: 8-row x 16-byte core
+          // matrices, 128 bytes apart along K and 1024 bytes apart along M.
+          uint8_t* a_st = st + Cfg::kAOff + r * Cfg::kABytes;
+          for (int c = lane; c < groups * 64; c += 32) {
+            int const row = c / 8, chunk = c % 8;
+            int32_t const t = __shfl_sync(0xffffffffu, token, row);
+            uint8_t const* src =
+                p.a + int64_t(max(t, 0)) * p.K + (k + r) * kBlockK + chunk * 16;
+            cp_async_16(a_st + (row / 8) * 1024 + (row % 8) * 16 + chunk * 128,
+                        src, t >= 0);
+          }
+          // A scales: row r's four K32 scales land in lane r of the block.
+          if (lane < groups * 8)
+            cp_async_4(st + Cfg::kAScaleOff + r * kAScaleBytes + lane * 16,
+                       s_row + (k + r) * 4, token >= 0);
         }
-        // A scales: row r's four K32 scales land in lane r of the block.
-        if (lane < groups * 8)
-          cp_async_4(st + Cfg::kAScaleOff + lane * 16,
-                     p.a_scales + int64_t(max(token, 0)) * (p.K / 32) + k * 4,
-                     token >= 0);
         cp_async_arrive(&full_bar[stage]);
+        if (++stage == kStages) stage = 0, phase ^= 1;
       }
     }
   } else if (warp == kMmaWarp) {
@@ -500,83 +535,69 @@ __global__ void __launch_bounds__(kThreads, 1)
                              (uint32_t(kBlockM / 16) << 24) | (1u << 31);
       // The second K64 half uses scale byte 2 of each 4-byte A/B scale word.
       uint32_t const idesc_hi = idesc | (2u << 29) | (2u << 4);
-      int const commit_group = (p.debug & 4096)  ? 8
-                               : (p.debug & 256) ? 4
-                               : (p.debug & 128) ? 2
-                                                 : 1;
-      long long c_fence = 0, c_mma = 0, c_commit = 0;
-      int pending = 0;
-      int step = 0, local = 0;
+      int stage = 0, steps = 0, local = 0;
+      uint32_t phase = 0;
       long long t_first = 0, t_last = 0, t_commit = 0, c_full = 0, c_acc = 0;
+      int expert_next = first_expert;
+      int const first_row8 = first.m_block * kRows + 8;
+      int32_t sid8_next = first_row8 < p.num_sorted
+                              ? p.sorted_token_ids[first_row8]
+                              : p.num_valid_tokens;
       for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
         Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-        if (p.expert_ids[it.m_block] < 0) continue;
+        int const expert = expert_next;
+        int32_t const sid8 = sid8_next;
+        int const i_next = i + gridDim.x;
+        expert_next = expert_of(i_next);
+        if (i_next < num_items)
+          sid8_next = p.sorted_token_ids
+              [decode_item(i_next, n_tiles, p.splits, k_tiles).m_block * kRows +
+               8];
+        if (expert < 0) continue;
         // At most 8 real rows: every M group of the descriptor reads group 0.
-        bool const small =
-            p.sorted_token_ids[it.m_block * kRows + 8] >= p.num_valid_tokens;
-        int const a_sbo = small ? 0 : 1024;
+        int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 1024;
 
-        long long c0 = clock64();
+        long long c0 = tr ? clock64() : 0;
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
-        c_acc += clock64() - c0;
+        if (tr) c_acc += clock64() - c0;
         tc_fence_after();
-        for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
-          int const stage = step % kStages;
-          c0 = clock64();
-          // Metadata warps arrive after the stage lands (and, with
-          // tcgen05.st, after filling its slot), so this covers both.
-          mbar_wait((p.debug & 2048) ? &full_bar[stage] : &meta_bar[stage],
-                    (step / kStages) & 1);
-          long long c1 = clock64();
-          c_full += c1 - c0;
+        for (int k = it.k_begin; k < it.k_end; k += kRecs, ++steps) {
+          int const recs = min(kRecs, it.k_end - k);
+          if (tr) c0 = clock64();
+          // Metadata warps arrive once the stage has landed and its TMEM
+          // slots are written.
+          mbar_wait(&meta_bar[stage], phase);
           if (tr) {
+            c_full += clock64() - c0;
             t_last = gtime();
-            if (step == 0) t_first = t_last;
+            if (steps == 0) t_first = t_last;
           }
           tc_fence_after();
           // Activations arrived through cp.async (generic proxy).
-          if (!(p.debug & 64))
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-          c0 = clock64();
-          c_fence += c0 - c1;
-          int const op_stage = (p.debug & 1024) ? 0 : stage;
-          uint8_t* st = smem + op_stage * Cfg::kStageBytes;
-          uint8_t* b_st = st + Cfg::kBOff;
-          // Metadata columns are reused every K tile; tcgen05.cp and
-          // tcgen05.mma issued by one thread execute in order.
-          uint32_t const meta =
-              tmem + kBlockN + ((p.debug & 512) ? 0 : stage) * kMetaCols;
-          if (p.meta_st == 0) {
-            copy_meta(meta + kMetaAScale, st + Cfg::kAScaleOff);
-            copy_meta(meta + kMetaBScale, b_st + kBScaleOff);
-            copy_meta(meta + kMetaBScale + 4,
-                      b_st + kBScaleOff + kTileScaleBytes);
-            copy_meta(meta + kMetaBook, b_st + kBBookOff);
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          uint8_t* st = smem + stage * Cfg::kStageBytes;
+          if (!(p.debug & 4)) {
+            for (int r = 0; r < recs; ++r) {
+              uint32_t const meta =
+                  tmem + kBlockN + (stage * kRecs + r) * kMetaCols;
+              uint8_t* a_st = st + Cfg::kAOff + r * Cfg::kABytes;
+              uint64_t const a_lo = smem_desc(a_st, 128, a_sbo);
+              uint64_t const a_hi = smem_desc(a_st + 512, 128, a_sbo);
+              // Compressed B rows are 48 bytes; descriptor bit 53 selects
+              // the second K64 half of each row.
+              uint64_t const b_lo = smem_desc(
+                  st + Cfg::kBOff + r * kBStageBytes + kBIdxOff, 128, 384);
+              uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
+              mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
+                           meta + kMetaAScale, meta + kMetaBScale,
+                           k + r != it.k_begin);
+              mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2,
+                              idesc_hi, meta + kMetaAScale,
+                              meta + kMetaBScale);
+            }
           }
-          uint64_t const a_lo = smem_desc(st + Cfg::kAOff, 128, a_sbo);
-          uint64_t const a_hi = smem_desc(st + Cfg::kAOff + 512, 128, a_sbo);
-          // Compressed B rows are 48 bytes; descriptor bit 53 selects the
-          // second K64 half of each row.
-          uint64_t const b_lo = smem_desc(b_st + kBIdxOff, 128, 384);
-          uint64_t const b_hi = b_lo | (uint64_t(1) << 53);
-          int const reps = (p.debug & 4) ? 0 : (p.debug & 32) ? 2 : 1;
-          for (int r = 0; r < reps; ++r) {
-            mma_lut_fill(tmem, a_lo, b_lo, meta + kMetaBook, idesc,
-                         meta + kMetaAScale, meta + kMetaBScale,
-                         r > 0 || k != it.k_begin);
-            mma_lut_lastuse(tmem, a_hi, b_hi, meta + kMetaBook + 2, idesc_hi,
-                            meta + kMetaAScale, meta + kMetaBScale);
-          }
-          c1 = clock64();
-          c_mma += c1 - c0;
-          // Each commit tracks every earlier MMA, so a batch of commits
-          // after the newest step frees all of the batch's stages.
-          if (++pending == commit_group || k + 1 == it.k_end) {
-            for (int j = pending - 1; j >= 0; --j)
-              tc_commit(&empty_bar[(step - j) % kStages]);
-            pending = 0;
-          }
-          c_commit += clock64() - c1;
+          tc_commit(&empty_bar[stage]);
+          if (++stage == kStages) stage = 0, phase ^= 1;
         }
         tc_commit(&acc_full_bar);
         if (tr) t_commit = gtime();
@@ -588,9 +609,6 @@ __global__ void __launch_bounds__(kThreads, 1)
         trc[5] = t_commit;
         trc[9] = c_full;
         trc[10] = c_acc;
-        trc[16] = c_fence;
-        trc[17] = c_mma;
-        trc[18] = c_commit;
       }
     }
     __syncwarp();
@@ -599,26 +617,33 @@ __global__ void __launch_bounds__(kThreads, 1)
     // Each warp writes its lane quarter, which gives the replication across
     // all four quarters that tcgen05.cp.32x128b.warpx4 would.
     uint32_t const lane_base = tmem + (uint32_t((warp % 4) * 32) << 16);
-    int step = 0;
+    int stage = 0;
+    uint32_t phase = 0;
+    int expert_next = first_expert;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
-      if (p.expert_ids[it.m_block] < 0) continue;
-      for (int k = it.k_begin; k < it.k_end; ++k, ++step) {
-        int const stage = step % kStages;
-        mbar_wait(&full_bar[stage], (step / kStages) & 1);
-        if (p.meta_st == 1) {
-          uint8_t const* st = smem + stage * Cfg::kStageBytes;
-          uint8_t const* b_st = st + Cfg::kBOff;
+      int const expert = expert_next;
+      expert_next = expert_of(i + gridDim.x);
+      if (expert < 0) continue;
+      for (int k = it.k_begin; k < it.k_end; k += kRecs) {
+        int const recs = min(kRecs, it.k_end - k);
+        mbar_wait(&full_bar[stage], phase);
+        uint8_t const* st = smem + stage * Cfg::kStageBytes;
+        for (int r = 0; r < recs; ++r) {
+          uint8_t const* b_st = st + Cfg::kBOff + r * kBStageBytes;
           uint4 v[4];
-          v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff)[lane];
+          v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff +
+                                                r * kAScaleBytes)[lane];
           v[1] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff)[lane];
           v[2] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff +
                                                 kTileScaleBytes)[lane];
           v[3] = reinterpret_cast<uint4 const*>(b_st + kBBookOff)[lane];
-          tmem_st16(lane_base + kBlockN + stage * kMetaCols, v);
-          tc_fence_before();
+          tmem_st16(lane_base + kBlockN + (stage * kRecs + r) * kMetaCols, v);
         }
+        tmem_wait_st();
+        tc_fence_before();
         mbar_arrive(&meta_bar[stage]);
+        if (++stage == kStages) stage = 0, phase ^= 1;
       }
     }
   } else {
@@ -627,7 +652,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int const row = quarter * 32 + lane;
     uint32_t const lane_addr = tmem + (uint32_t(quarter * 32) << 16);
     OutT* const c = static_cast<OutT*>(p.c);
-    int local = 0, meta_step = 0;
+    int local = 0;
     long long c_acc = 0;
     for (int i = blockIdx.x; i < num_items; i += gridDim.x) {
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
@@ -647,33 +672,13 @@ __global__ void __launch_bounds__(kThreads, 1)
         continue;
       }
 
-      if (p.meta_st == 2) {
-        // Fill this item's metadata slots as its stages land; the MMAs for
-        // it cannot start before the previous item is drained anyway.
-        for (int k = it.k_begin; k < it.k_end; ++k, ++meta_step) {
-          int const stage = meta_step % kStages;
-          mbar_wait(&full_bar[stage], (meta_step / kStages) & 1);
-          uint8_t const* st = smem + stage * Cfg::kStageBytes;
-          uint8_t const* b_st = st + Cfg::kBOff;
-          uint4 v[4];
-          v[0] = reinterpret_cast<uint4 const*>(st + Cfg::kAScaleOff)[lane];
-          v[1] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff)[lane];
-          v[2] = reinterpret_cast<uint4 const*>(b_st + kBScaleOff +
-                                                kTileScaleBytes)[lane];
-          v[3] = reinterpret_cast<uint4 const*>(b_st + kBBookOff)[lane];
-          tmem_st16(lane_addr + kBlockN + stage * kMetaCols, v);
-          tc_fence_before();
-          mbar_arrive(&meta_bar[stage]);
-        }
-      }
-
       float const w = (p.topk_weights != nullptr && valid)
                           ? p.topk_weights[sid]
                           : 1.0f;
       bool const direct = p.splits == 1;
-      long long const c0 = clock64();
+      long long const c0 = tr ? clock64() : 0;
       mbar_wait(&acc_full_bar, local & 1);
-      c_acc += clock64() - c0;
+      if (tr) c_acc += clock64() - c0;
       tc_fence_after();
       if (!(p.debug & 16) && __any_sync(0xffffffffu, valid)) {
 #pragma unroll 1
@@ -681,23 +686,23 @@ __global__ void __launch_bounds__(kThreads, 1)
           uint32_t v[32];
           tmem_ld32(lane_addr + n, v);
           if (valid) {
-          float f[32];
+            float f[32];
 #pragma unroll
-          for (int j = 0; j < 32; ++j) f[j] = __uint_as_float(v[j]);
-          if (direct) {
-            OutT* dst = c + sid * int64_t(p.N) + col0 + n;
+            for (int j = 0; j < 32; ++j) f[j] = __uint_as_float(v[j]);
+            if (direct) {
+              OutT* dst = c + sid * int64_t(p.N) + col0 + n;
 #pragma unroll
-            for (int j = 0; j < 32; j += 8) store8<OutT>(dst + j, f + j, w);
-          } else {
-            float4* dst = reinterpret_cast<float4*>(
-                p.partials +
-                (int64_t(it.split) * p.num_valid_tokens + sid) * p.N + col0 +
-                n);
+              for (int j = 0; j < 32; j += 8) store8<OutT>(dst + j, f + j, w);
+            } else {
+              float4* dst = reinterpret_cast<float4*>(
+                  p.partials +
+                  (int64_t(it.split) * p.num_valid_tokens + sid) * p.N +
+                  col0 + n);
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
-              dst[j] = make_float4(f[4 * j], f[4 * j + 1], f[4 * j + 2],
-                                   f[4 * j + 3]);
-          }
+              for (int j = 0; j < 8; ++j)
+                dst[j] = make_float4(f[4 * j], f[4 * j + 1], f[4 * j + 2],
+                                     f[4 * j + 3]);
+            }
           }
         }
       }
@@ -836,13 +841,10 @@ inline void print_trace(long long const* d_trace, int ctas,
   stats("mma wait full us", cyc(9));
   stats("mma wait acc_empty us", cyc(10));
   stats("epi wait acc_full us", cyc(14));
-  stats("mma fences us", cyc(16));
-  stats("mma issue (cp+mma) us", cyc(17));
-  stats("mma commits us", cyc(18));
   stats("steady GB/s (1st..last)", [&](int c) {
     long long const dt = at(c, 4) - at(c, 3);
     return at(c, 12) > 1 && dt > 0
-               ? double(at(c, 12) - 1) * kBStageBytes / dt
+               ? double(at(c, 12) - 1) * kRecs * kBStageBytes / dt
                : 0.0;
   });
 }
@@ -962,14 +964,13 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
   params.num_tokens_post_padded =
       num_tokens_post_padded.const_data_ptr<int32_t>();
   params.num_valid_tokens = static_cast<int>(rows);
+  params.num_sorted = static_cast<int>(sorted_token_ids.size(0));
   params.top_k = static_cast<int>(top_k);
   params.N = static_cast<int>(N);
   params.K = static_cast<int>(K);
   params.splits = static_cast<int>(splits);
   char const* debug_env = std::getenv("VLLM_LUT_B_STREAM_DEBUG");
   params.debug = debug_env ? std::atoi(debug_env) : 0;
-  char const* meta_env = std::getenv("VLLM_LUT_B_STREAM_META");
-  params.meta_st = meta_env ? std::atoi(meta_env) : 1;
   params.trace = nullptr;
 
   int64_t const max_items = num_m_blocks * n_tiles * splits;
@@ -993,8 +994,7 @@ void lut_b_moe_gemm_stream(torch::stable::Tensor const& a,
     int const smem_bytes = Config<kGroups>::kSmemBytes;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_bytes);
-    int const threads = params.meta_st == 2 ? kThreads - kMetaThreads : kThreads;
-    kernel<<<grid, threads, smem_bytes, stream>>>(params);
+    kernel<<<grid, kThreads, smem_bytes, stream>>>(params);
   };
   // With at most 8 routed rows every block fits one 8-row A group, and the
   // smaller stage buys a deeper weight ring. Otherwise blocks hold up to 32.
