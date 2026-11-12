@@ -518,9 +518,8 @@ __global__ void __launch_bounds__(kThreads, 1)
                         src, t >= 0);
           }
           // A scales: the MMA reads accumulator row R's scale word from
-          // record R % 32, word R / 32. Token row 8j + i sits in accumulator
-          // row 32j + i (SBO 256), so its word goes to record i, word j; a
-          // small block (SBO 0) repeats rows 0-7 in all four words.
+          // record R % 32, word R / 32. A small block (SBO 0) repeats rows
+          // 0-7 in every lane quarter, so their words fill all four.
           uint8_t* as_st = st + Cfg::kAScaleOff + r * kAScaleBytes;
           if (groups == 1) {
             int32_t const ti = __shfl_sync(0xffffffffu, token, lane / 4);
@@ -529,8 +528,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                            (k + r) * 4,
                        ti >= 0);
           } else if (groups > 1 && lane < groups * 8) {
-            cp_async_4(as_st + (lane % 8) * 16 + (lane / 8) * 4,
-                       s_row + (k + r) * 4, token >= 0);
+            cp_async_4(as_st + lane * 16, s_row + (k + r) * 4, token >= 0);
           }
         }
         cp_async_arrive(&full_bar[stage]);
@@ -565,11 +563,10 @@ __global__ void __launch_bounds__(kThreads, 1)
               [decode_item(i_next, n_tiles, p.splits, k_tiles).m_block * kRows +
                8];
         if (expert < 0) continue;
-        // A holds token groups (8 rows) 1 KB apart. SBO 256 places token
-        // group j in M group 4j, i.e. TMEM lanes 32j..32j+7, so all four
-        // epilogue warps drain rows. With at most 8 real rows, SBO 0 points
-        // every M group at group 0 and each lane quarter holds rows 0-7.
-        int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 256;
+        // With at most 8 real rows, SBO 0 points every M group at group 0,
+        // so each TMEM lane quarter holds rows 0-7. (SBO 256, which would
+        // spread larger blocks over the quarters, made the MMAs slower.)
+        int const a_sbo = sid8 >= p.num_valid_tokens ? 0 : 1024;
 
         long long c0 = tr ? clock64() : 0;
         mbar_wait(&acc_empty_bar, (local & 1) ^ 1);
@@ -671,9 +668,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       Item const it = decode_item(i, n_tiles, p.splits, k_tiles);
       int32_t const* const blk = p.sorted_token_ids + it.m_block * kRows;
       int64_t const col0 = int64_t(it.n_tile) * kBlockN;
-      // Issue all three loads before choosing between them.
       int32_t const sid_lane = blk[lane];
-      int32_t const sid_group = blk[(quarter * 8 + lane) % kRows];
       bool const small = blk[8] >= p.num_valid_tokens;
 
       if (p.expert_ids[it.m_block] < 0) {
@@ -687,11 +682,13 @@ __global__ void __launch_bounds__(kThreads, 1)
         continue;
       }
 
-      // Lanes 0-7 of this quarter hold token rows 8 * quarter + lane, or
-      // rows 0-7 of a small block, whose columns the quarters then split.
-      int const t = small ? lane : quarter * 8 + lane;
-      int32_t const sid = lane >= 8          ? p.num_valid_tokens
-                          : small ? sid_lane : sid_group;
+      // A small block's rows 0-7 are in lanes 0-7 of every quarter, so the
+      // four warps split its columns; a larger block's rows are lanes 0-31
+      // of quarter 0.
+      int const t = lane;
+      int32_t const sid = (small ? lane < 8 : quarter == 0)
+                              ? sid_lane
+                              : p.num_valid_tokens;
       bool const valid = sid < p.num_valid_tokens;
       int const n_begin = small ? quarter * (kBlockN / 4) : 0;
       int const n_end = small ? n_begin + kBlockN / 4 : kBlockN;
@@ -740,7 +737,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       // epi_* only hold real rows: the reduction reads rows [0, rows).
       int const warp_rows = __popc(__ballot_sync(0xffffffffu, valid));
       // Small blocks repeat rows 0-7 in every quarter; count them once.
-      if (lane == 0) epi_rows[quarter] = small && quarter > 0 ? 0 : warp_rows;
+      if (lane == 0) epi_rows[quarter] = quarter > 0 ? 0 : warp_rows;
       if (valid) {
         epi_sid[t] = sid;
         epi_weight[t] = w;
